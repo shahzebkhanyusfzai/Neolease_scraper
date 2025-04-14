@@ -31,7 +31,7 @@ DB_PASS = os.environ.get("DB_PASS", "DKuNZ0Z4OhuNKWvEFaAuWINgr7BfgyTE")
 DB_HOST = os.environ.get("DB_HOST", "dpg-cvslkuvdiees73fiv97g-a.oregon-postgres.render.com")
 DB_PORT = os.environ.get("DB_PORT", "5432")
 
-MAX_PAGES = 50  # Prevent infinite loops
+MAX_PAGES = 90  # Prevent infinite loops
 MAX_REPEAT_THRESHOLD = 2  # If we see the same links N times in a row => stop
 
 # ---------- DB UTILS ----------
