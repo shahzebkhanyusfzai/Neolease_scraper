@@ -31,6 +31,9 @@ DB_PASS = os.environ.get("DB_PASS", "DKuNZ0Z4OhuNKWvEFaAuWINgr7BfgyTE")
 DB_HOST = os.environ.get("DB_HOST", "dpg-cvslkuvdiees73fiv97g-a.oregon-postgres.render.com")
 DB_PORT = os.environ.get("DB_PORT", "5432")
 
+MAX_PAGES = 50  # Prevent infinite loops
+MAX_REPEAT_THRESHOLD = 2  # If we see the same links N times in a row => stop
+
 # ---------- DB UTILS ----------
 def connect_db():
     return psycopg2.connect(
@@ -53,18 +56,17 @@ def robust_fetch(url, session, max_retries=3):
         try:
             resp = session.get(url, headers=HEADERS, timeout=15)
             print(f"[fetch] GET {url} => {resp.status_code}")
-            # If we get 403/429, might be rate-limit or block => backoff
+            # If we get 403/429, might be rate-limit => backoff
             if resp.status_code in (403, 429):
                 if attempt < max_retries - 1:
                     wait = backoffs[attempt]
-                    print(f"[warn] {resp.status_code} => wait {wait}s, retrying...")
+                    print(f"[warn] {resp.status_code} => wait {wait}s, retrying {url}...")
                     time.sleep(wait)
                     attempt += 1
                     continue
                 else:
-                    print(f"[error] {resp.status_code} after {max_retries} tries => skip.")
+                    print(f"[error] {resp.status_code} after {max_retries} tries => skip {url}")
                     return None
-            # Return if we get an OK or other normal code
             return resp
         except (requests.exceptions.ConnectTimeout,
                 requests.exceptions.ReadTimeout,
@@ -86,7 +88,7 @@ def get_listing_links(page, session):
         return []
     tree = html.fromstring(resp.text)
 
-    # check if first product found => if not => no more
+    # check if product-result-1 found => if not => no more
     first = tree.xpath('//main[@id="main-content"]//a[@data-testid="product-result-1"]/@href')
     if not first:
         return []
@@ -97,7 +99,6 @@ def get_listing_links(page, session):
         found = tree.xpath(xp)
         if found:
             links.extend(found)
-    # convert to absolute
     abs_links = [urljoin(BASE_URL, ln) for ln in links]
     return abs_links
 
@@ -125,8 +126,8 @@ def parse_detail(url, session):
     if not resp or not resp.ok:
         print(f"[error] Cannot fetch detail => {url}")
         return None
-    tree = html.fromstring(resp.text)
 
+    tree = html.fromstring(resp.text)
     def t(xp):
         return tree.xpath(xp)
 
@@ -185,47 +186,68 @@ def parse_detail(url, session):
 
 # ---------- MAIN ------------
 def main():
-    # 1) Scrape all data into memory
+    print("[info] Starting DTC scraper...")
+
     session = requests.Session()
     session.headers.update(HEADERS)
+
     all_listings = []
+
+    seen_linksets = set()
+    repeated_pages = 0
 
     page = 1
     while True:
+        if page > MAX_PAGES:
+            print(f"[warn] Reached page {page} > {MAX_PAGES} => stop scraping.")
+            break
+
         print(f"[info] Listing page {page} ...")
         links = get_listing_links(page, session)
         if not links:
             print("[info] No more links => stop pagination.")
             break
+
         print(f"[info] Found {len(links)} links on page {page}.")
+        linkset = frozenset(links)
+        if linkset in seen_linksets:
+            repeated_pages += 1
+            print(f"[warn] This page's links were already seen => repeated_pages={repeated_pages}")
+            if repeated_pages >= MAX_REPEAT_THRESHOLD:
+                print("[warn] Repeated pages threshold reached => stop pagination.")
+                break
+        else:
+            repeated_pages = 0
+            seen_linksets.add(linkset)
+
+        # Now parse each listing
         for idx, ln in enumerate(links, start=1):
             print(f"   -> detail: {ln}")
             rec = parse_detail(ln, session)
             if rec:
                 all_listings.append(rec)
-            time.sleep(1)  # small delay between details
+            time.sleep(1)  # small delay per detail
+
         page += 1
-        time.sleep(2)  # small delay between pages
+        time.sleep(2)  # small delay per page
 
     print(f"[info] Total listings scraped: {len(all_listings)}")
 
-    # 2) Insert into DB only if we have some data
     if not all_listings:
-        print("[error] No data scraped => skipping DB update.")
+        print("[error] No data scraped => skip DB update.")
         sys.exit(1)
 
     try:
         conn = connect_db()
         cur = conn.cursor()
 
-        # 2A) Clear old data (car_images, car_listings)
-        # If you only want to do this if success => do it now
-        print("[info] Truncating old data from DB...")
+        # TRUNCATE existing data
+        print("[info] Clearing old data in DB (car_images + car_listings)...")
         cur.execute("TRUNCATE car_images;")
         cur.execute("TRUNCATE car_listings RESTART IDENTITY CASCADE;")
         conn.commit()
 
-        # 2B) Insert new
+        # Insert new
         print("[info] Inserting new records...")
         insert_cl = """
         INSERT INTO car_listings (
@@ -238,12 +260,11 @@ def main():
         """
         insert_ci = """
         INSERT INTO car_images (image_url, car_listing_id)
-        VALUES (%s, %s)
+        VALUES (%s, %s);
         """
 
-        new_count = 0
+        count_inserted = 0
         for item in all_listings:
-            # Insert car_listings
             cur.execute(insert_cl, (
                 item["url"],
                 item["title"],
@@ -264,24 +285,24 @@ def main():
             ))
             new_id = cur.fetchone()[0]
 
-            # Insert images
+            # Insert image rows
             if item["images"]:
-                for img in item["images"]:
-                    cur.execute(insert_ci, (img, new_id))
+                for img_url in item["images"]:
+                    cur.execute(insert_ci, (img_url, new_id))
 
-            new_count += 1
+            count_inserted += 1
+
         conn.commit()
-        print(f"[info] Inserted {new_count} car_listings + images into DB successfully!")
+        print(f"[info] Inserted {count_inserted} listings into DB successfully!")
 
     except Exception as e:
         print(f"[error] DB error => {e}")
         sys.exit(1)
     finally:
-        if 'cur' in locals():
-            cur.close()
-        if 'conn' in locals():
-            conn.close()
+        if 'cur' in locals(): cur.close()
+        if 'conn' in locals(): conn.close()
         print("[info] DB connection closed.")
+
 
 if __name__ == "__main__":
     main()
