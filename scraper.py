@@ -1,17 +1,19 @@
-import os
-import csv
+#!/usr/bin/env python3
 import sys
 import time
 import requests
+import psycopg2
+import os
 from lxml import html
 from urllib.parse import urljoin
 
+# ---------- CONFIG ----------
 BASE_URL = "https://www.dtc-lease.nl"
 LISTING_URL_TEMPLATE = (
     "https://www.dtc-lease.nl/voorraad"
     "?lease_type=financial"
-    "&voertuigen%5Bpage%5D={page}"
-    "&voertuigen%5BsortBy%5D=voertuigen_created_at_desc"
+    "&voertuigen%%5Bpage%%5D={page}"
+    "&voertuigen%%5BsortBy%%5D=voertuigen_created_at_desc"
 )
 
 HEADERS = {
@@ -21,209 +23,265 @@ HEADERS = {
         "Chrome/133.0.0.0 Mobile Safari/537.36"
     ),
     "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9,nl;q=0.8",
-    "Referer": "https://www.dtc-lease.nl/"
 }
 
-COOKIES = {
-    # If special cookies or session data is required, set them here
-}
+DB_NAME = os.environ.get("DB_NAME", "neolease_db")
+DB_USER = os.environ.get("DB_USER", "neolease_db_user")
+DB_PASS = os.environ.get("DB_PASS", "DKuNZ0Z4OhuNKWvEFaAuWINgr7BfgyTE")
+DB_HOST = os.environ.get("DB_HOST", "dpg-cvslkuvdiees73fiv97g-a.oregon-postgres.render.com")
+DB_PORT = os.environ.get("DB_PORT", "5432")
 
-CSV_COLUMNS = [
-    "URL", "Title", "Subtitle", "Financial Lease Price", "Financial Lease Term",
-    "Advertentienummer", "Merk", "Model", "Bouwjaar", "Km stand",
-    "Transmissie", "Prijs", "Brandstof", "Btw/marge", "Opties & Accessoires",
-    "Address", "Images"
-]
+# ---------- DB UTILS ----------
+def connect_db():
+    return psycopg2.connect(
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS,
+        host=DB_HOST,
+        port=DB_PORT
+    )
 
-def robust_fetch(session, url, max_retries=4):
+# ---------- SCRAPING UTILS ----------
+def robust_fetch(url, session, max_retries=3):
     """
-    Fetch a URL with backoff if we receive:
-      - status 403 or 429 (possible block or rate limit)
-      - requests exceptions like timeouts, connection errors
-    We'll do up to 'max_retries' attempts with exponential-like backoff
-    e.g. 10s, 30s, 2m, 5m, etc.
-
-    If all attempts fail, return None so we can skip that page.
+    Fetch URL with basic retry/backoff for 403/429 or timeouts.
+    Returns requests.Response or None if all fails.
     """
-    backoff_sec = [10, 30, 120, 300]  # example backoff intervals
+    backoffs = [10, 30, 120]  # seconds
     attempt = 0
     while attempt < max_retries:
         try:
-            response = session.get(url, headers=HEADERS, cookies=COOKIES, timeout=20)
-            print(f"GET {url} => {response.status_code}")
-
-            # If we got 403 or 429, back off
-            if response.status_code in (403, 429):
+            resp = session.get(url, headers=HEADERS, timeout=15)
+            print(f"[fetch] GET {url} => {resp.status_code}")
+            # If we get 403/429, might be rate-limit or block => backoff
+            if resp.status_code in (403, 429):
                 if attempt < max_retries - 1:
-                    wait = backoff_sec[attempt]
-                    print(f"[WARN] Status {response.status_code} => sleeping {wait}s before retry...")
+                    wait = backoffs[attempt]
+                    print(f"[warn] {resp.status_code} => wait {wait}s, retrying...")
                     time.sleep(wait)
                     attempt += 1
                     continue
                 else:
-                    print(f"[ERROR] {response.status_code} after max retries => skipping {url}")
+                    print(f"[error] {resp.status_code} after {max_retries} tries => skip.")
                     return None
-
-            # If we got a normal OK or other code, just return it
-            if response.ok:
-                return response
-            else:
-                print(f"[WARN] Unexpected status {response.status_code} => returning anyway.")
-                return response
-
-        except (requests.exceptions.ReadTimeout,
-                requests.exceptions.ConnectTimeout,
+            # Return if we get an OK or other normal code
+            return resp
+        except (requests.exceptions.ConnectTimeout,
+                requests.exceptions.ReadTimeout,
                 requests.exceptions.ConnectionError) as e:
-            # handle timeouts or connection errors
             if attempt < max_retries - 1:
-                wait = backoff_sec[attempt]
-                print(f"[WARN] {type(e).__name__} => sleeping {wait}s before retry on {url} ...")
+                wait = backoffs[attempt]
+                print(f"[warn] {type(e).__name__} => wait {wait}s, retrying {url}...")
                 time.sleep(wait)
                 attempt += 1
             else:
-                print(f"[ERROR] {type(e).__name__} after max retries => skipping {url}")
+                print(f"[error] {type(e).__name__} after {max_retries} tries => skip {url}")
                 return None
     return None
 
-
-def get_listing_links(session, page_number):
-    """
-    Fetch the listing page for 'page_number' and collect up to 16 product-result links.
-    If no 'product-result-1', we assume no results => stop pagination.
-    """
-    url = LISTING_URL_TEMPLATE.format(page=page_number)
-    resp = robust_fetch(session, url)
+def get_listing_links(page, session):
+    url = LISTING_URL_TEMPLATE.format(page=page)
+    resp = robust_fetch(url, session)
     if not resp or not resp.ok:
         return []
-
     tree = html.fromstring(resp.text)
-    # Check if product-result-1 exists. If not, no results => stop
-    first_product = tree.xpath('//main[@id="main-content"]//a[@data-testid="product-result-1"]/@href')
-    if not first_product:
+
+    # check if first product found => if not => no more
+    first = tree.xpath('//main[@id="main-content"]//a[@data-testid="product-result-1"]/@href')
+    if not first:
         return []
 
-    # Gather product-result-i links up to i=16
     links = []
     for i in range(1, 17):
         xp = f'//main[@id="main-content"]//a[@data-testid="product-result-{i}"]/@href'
         found = tree.xpath(xp)
         if found:
             links.extend(found)
+    # convert to absolute
+    abs_links = [urljoin(BASE_URL, ln) for ln in links]
+    return abs_links
 
-    full_links = [urljoin(BASE_URL, ln) for ln in links]
-    return full_links
-
-
-def parse_detail_page(session, detail_url):
-    """
-    Fetch detail page and extract data fields into a dict.
-    Return the dict or None if fetch fails.
-    """
-    data = dict.fromkeys(CSV_COLUMNS, None)
-    data["URL"] = detail_url
-
-    resp = robust_fetch(session, detail_url)
+def parse_detail(url, session):
+    record = {
+        "url": url,
+        "title": None,
+        "subtitle": None,
+        "financial_lease_price": None,
+        "financial_lease_term": None,
+        "advertentienummer": None,
+        "merk": None,
+        "model": None,
+        "bouwjaar": None,
+        "km_stand": None,
+        "transmissie": None,
+        "prijs": None,
+        "brandstof": None,
+        "btw_marge": None,
+        "opties_accessoires": None,
+        "address": None,
+        "images": []
+    }
+    resp = robust_fetch(url, session)
     if not resp or not resp.ok:
-        print(f"[ERROR] Could not fetch detail page => skipping: {detail_url}")
+        print(f"[error] Cannot fetch detail => {url}")
         return None
-
     tree = html.fromstring(resp.text)
 
     def t(xp):
         return tree.xpath(xp)
 
+    # Title, subtitle, fl price, term
     title = t('//h1[@class="h1-sm tablet:h1 text-trustful-1"]/text()')
-    data["Title"] = title[0].strip() if title else None
+    record["title"] = title[0].strip() if title else None
 
     subtitle = t('//p[@class="type-auto-sm tablet:type-auto-m text-trustful-1"]/text()')
-    data["Subtitle"] = subtitle[0].strip() if subtitle else None
+    record["subtitle"] = subtitle[0].strip() if subtitle else None
 
-    fl_price = t('//div[@data-testid="price-block"]//h2/text()')
-    data["Financial Lease Price"] = fl_price[0].strip() if fl_price else None
+    flp = t('//div[@data-testid="price-block"]//h2/text()')
+    record["financial_lease_price"] = flp[0].strip() if flp else None
 
-    fl_term = t('//div[@data-testid="price-block"]//p[contains(@class,"info-sm") and contains(text(),"mnd")]/text()')
-    data["Financial Lease Term"] = fl_term[0].strip() if fl_term else None
+    flt = t('//div[@data-testid="price-block"]//p[contains(@class,"info-sm") and contains(text(),"mnd")]/text()')
+    record["financial_lease_term"] = flt[0].strip() if flt else None
 
-    ad_num = t('//div[contains(@class,"p-sm") and contains(text(),"Advertentienummer")]/text()')
-    if ad_num:
-        data["Advertentienummer"] = ad_num[0].split(":", 1)[-1].strip()
+    # Advertentienummer
+    adnum = t('//div[contains(@class,"p-sm") and contains(text(),"Advertentienummer")]/text()')
+    if adnum:
+        record["advertentienummer"] = adnum[0].split(":",1)[-1].strip()
 
     def spec(label):
         xp = f'//div[@class="text-p-sm text-grey-1" and normalize-space(text())="{label}"]/following-sibling::div/text()'
-        v = t(xp)
-        return v[0].strip() if v else None
+        val = t(xp)
+        return val[0].strip() if val else None
 
-    data["Merk"] = spec("Merk")
-    data["Model"] = spec("Model")
-    data["Bouwjaar"] = spec("Bouwjaar")
-    data["Km stand"] = spec("Km stand")
-    data["Transmissie"] = spec("Transmissie")
-    data["Prijs"] = spec("Prijs")
-    data["Brandstof"] = spec("Brandstof")
-    data["Btw/marge"] = spec("Btw/marge")
+    record["merk"] = spec("Merk")
+    record["model"] = spec("Model")
+    record["bouwjaar"] = spec("Bouwjaar")
+    record["km_stand"] = spec("Km stand")
+    record["transmissie"] = spec("Transmissie")
+    record["prijs"] = spec("Prijs")
+    record["brandstof"] = spec("Brandstof")
+    record["btw_marge"] = spec("Btw/marge")
 
+    # Opties & accessoires
     oa = t('//h2[contains(.,"Opties & Accessoires")]/following-sibling::ul/li/text()')
     if oa:
         cleaned = [x.strip() for x in oa if x.strip()]
-        data["Opties & Accessoires"] = ", ".join(cleaned)
+        record["opties_accessoires"] = ", ".join(cleaned)
 
+    # Address
     addr = t('//div[@class="flex justify-between"]/div/p[@class="text-p-sm font-light text-black tablet:text-p"]/text()')
-    data["Address"] = addr[0].strip() if addr else None
+    if addr:
+        record["address"] = addr[0].strip()
 
+    # Images
     imgs = t('//ul[@class="swiper-wrapper pb-10"]/li/img/@src')
     if imgs:
-        joined = []
         for i in imgs:
-            joined.append(urljoin(BASE_URL, i) if i.startswith("/") else i)
-        data["Images"] = ",".join(joined)
+            if i.startswith("/"):
+                i = urljoin(BASE_URL, i)
+            record["images"].append(i)
 
-    print(f"[DEBUG] Scraped data for {detail_url}: {data}")
-    return data
+    return record
 
-
+# ---------- MAIN ------------
 def main():
+    # 1) Scrape all data into memory
     session = requests.Session()
     session.headers.update(HEADERS)
+    all_listings = []
 
-    all_links = []
-    page_number = 1
-
-    print("[INFO] Gathering listing links from scratch (no more links.csv).")
+    page = 1
     while True:
-        print(f"\n=== Fetching listing page {page_number} ===")
-        links = get_listing_links(session, page_number)
+        print(f"[info] Listing page {page} ...")
+        links = get_listing_links(page, session)
         if not links:
-            print(f"No more links found on page {page_number}. Stopping pagination.")
+            print("[info] No more links => stop pagination.")
             break
-        print(f"Found {len(links)} links on page {page_number}")
-        all_links.extend(links)
-        page_number += 1
-        time.sleep(2)  # small pause between listing pages
+        print(f"[info] Found {len(links)} links on page {page}.")
+        for idx, ln in enumerate(links, start=1):
+            print(f"   -> detail: {ln}")
+            rec = parse_detail(ln, session)
+            if rec:
+                all_listings.append(rec)
+            time.sleep(1)  # small delay between details
+        page += 1
+        time.sleep(2)  # small delay between pages
 
-    print(f"[INFO] Total listing links found: {len(all_links)}")
+    print(f"[info] Total listings scraped: {len(all_listings)}")
 
-    # Overwrite dtc_lease_results.csv from scratch
-    # If you prefer to store in memory first, you can do so. We'll do row-by-row for big data sets.
-    with open("dtc_lease_results.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        writer.writeheader()
+    # 2) Insert into DB only if we have some data
+    if not all_listings:
+        print("[error] No data scraped => skipping DB update.")
+        sys.exit(1)
 
-        total_scraped = 0
-        for idx, link in enumerate(all_links, start=1):
-            print(f"\n[INFO] Scraping detail {idx}/{len(all_links)} => {link}")
-            record = parse_detail_page(session, link)
-            if record is None:
-                print(f"[WARN] Skipping listing {link} due to fetch error.")
-            else:
-                writer.writerow(record)
-                total_scraped += 1
-                print(f"[INFO] Scraped so far: {total_scraped}")
-            # Sleep after each detail fetch
-            time.sleep(2)
+    try:
+        conn = connect_db()
+        cur = conn.cursor()
 
-    print(f"[DONE] Wrote {total_scraped} records to dtc_lease_results.csv.")
+        # 2A) Clear old data (car_images, car_listings)
+        # If you only want to do this if success => do it now
+        print("[info] Truncating old data from DB...")
+        cur.execute("TRUNCATE car_images;")
+        cur.execute("TRUNCATE car_listings RESTART IDENTITY CASCADE;")
+        conn.commit()
 
+        # 2B) Insert new
+        print("[info] Inserting new records...")
+        insert_cl = """
+        INSERT INTO car_listings (
+            url, title, subtitle, financial_lease_price, financial_lease_term,
+            advertentienummer, merk, model, bouwjaar, km_stand,
+            transmissie, prijs, brandstof, btw_marge, opties_accessoires, address
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id;
+        """
+        insert_ci = """
+        INSERT INTO car_images (image_url, car_listing_id)
+        VALUES (%s, %s)
+        """
+
+        new_count = 0
+        for item in all_listings:
+            # Insert car_listings
+            cur.execute(insert_cl, (
+                item["url"],
+                item["title"],
+                item["subtitle"],
+                item["financial_lease_price"],
+                item["financial_lease_term"],
+                item["advertentienummer"],
+                item["merk"],
+                item["model"],
+                item["bouwjaar"],
+                item["km_stand"],
+                item["transmissie"],
+                item["prijs"],
+                item["brandstof"],
+                item["btw_marge"],
+                item["opties_accessoires"],
+                item["address"]
+            ))
+            new_id = cur.fetchone()[0]
+
+            # Insert images
+            if item["images"]:
+                for img in item["images"]:
+                    cur.execute(insert_ci, (img, new_id))
+
+            new_count += 1
+        conn.commit()
+        print(f"[info] Inserted {new_count} car_listings + images into DB successfully!")
+
+    except Exception as e:
+        print(f"[error] DB error => {e}")
+        sys.exit(1)
+    finally:
+        if 'cur' in locals():
+            cur.close()
+        if 'conn' in locals():
+            conn.close()
+        print("[info] DB connection closed.")
 
 if __name__ == "__main__":
     main()
