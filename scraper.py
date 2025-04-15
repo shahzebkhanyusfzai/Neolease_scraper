@@ -86,7 +86,7 @@ def get_listing_links(page_number, session):
         return []
 
     links = []
-    for i in range(1, 17):
+    for i in range(0, 16):
         xp = f'//main[@id="main-content"]//a[@data-testid="product-result-{i}"]/@href'
         found = tree.xpath(xp)
         if found:
