@@ -7,13 +7,12 @@ import os
 from lxml import html
 from urllib.parse import urljoin
 
-# ---------- CONFIG ----------
 BASE_URL = "https://www.dtc-lease.nl"
 LISTING_URL_TEMPLATE = (
     "https://www.dtc-lease.nl/voorraad"
     "?lease_type=financial"
-    "&voertuigen%%5Bpage%%5D={page}"
-    "&voertuigen%%5BsortBy%%5D=voertuigen_created_at_desc"
+    "&voertuigen%5Bpage%5D={page}"
+    "&voertuigen%5BsortBy%5D=voertuigen_created_at_desc"
 )
 
 HEADERS = {
@@ -25,17 +24,15 @@ HEADERS = {
     "Accept": "*/*",
 }
 
-DB_NAME = os.environ.get("DB_NAME", "neolease_db")
-DB_USER = os.environ.get("DB_USER", "neolease_db_user")
-DB_PASS = os.environ.get("DB_PASS", "DKuNZ0Z4OhuNKWvEFaAuWINgr7BfgyTE")
-DB_HOST = os.environ.get("DB_HOST", "dpg-cvslkuvdiees73fiv97g-a.oregon-postgres.render.com")
-DB_PORT = os.environ.get("DB_PORT", "5432")
+# Pull DB credentials from environment or fallback:
+DB_NAME = os.getenv("DB_NAME", "neolease_db")
+DB_USER = os.getenv("DB_USER", "neolease_db_user")
+DB_PASS = os.getenv("DB_PASS", "DKuNZ0Z4OhuNKWvEFaAuWINgr7BfgyTE")
+DB_HOST = os.getenv("DB_HOST", "dpg-cvslkuvdiees73fiv97g-a.oregon-postgres.render.com")
+DB_PORT = os.getenv("DB_PORT", "5432")
 
-MAX_PAGES = 90  # Prevent infinite loops
-MAX_REPEAT_THRESHOLD = 2  # If we see the same links N times in a row => stop
-
-# ---------- DB UTILS ----------
 def connect_db():
+    """Connect to Postgres with psycopg2."""
     return psycopg2.connect(
         dbname=DB_NAME,
         user=DB_USER,
@@ -44,36 +41,30 @@ def connect_db():
         port=DB_PORT
     )
 
-# ---------- SCRAPING UTILS ----------
-def robust_fetch(url, session, max_retries=3):
-    """
-    Fetch URL with basic retry/backoff for 403/429 or timeouts.
-    Returns requests.Response or None if all fails.
-    """
-    backoffs = [10, 30, 120]  # seconds
+def robust_fetch(url, session, max_retries=4):
+    """Similar robust fetch as local version."""
+    backoffs = [10, 30, 60, 120]
     attempt = 0
     while attempt < max_retries:
         try:
             resp = session.get(url, headers=HEADERS, timeout=15)
             print(f"[fetch] GET {url} => {resp.status_code}")
-            # If we get 403/429, might be rate-limit => backoff
             if resp.status_code in (403, 429):
                 if attempt < max_retries - 1:
                     wait = backoffs[attempt]
-                    print(f"[warn] {resp.status_code} => wait {wait}s, retrying {url}...")
+                    print(f"[warn] {resp.status_code} => wait {wait}s, retry...")
                     time.sleep(wait)
                     attempt += 1
                     continue
                 else:
-                    print(f"[error] {resp.status_code} after {max_retries} tries => skip {url}")
+                    print(f"[error] {resp.status_code} after {max_retries} tries => skip.")
                     return None
             return resp
-        except (requests.exceptions.ConnectTimeout,
-                requests.exceptions.ReadTimeout,
+        except (requests.exceptions.Timeout,
                 requests.exceptions.ConnectionError) as e:
             if attempt < max_retries - 1:
                 wait = backoffs[attempt]
-                print(f"[warn] {type(e).__name__} => wait {wait}s, retrying {url}...")
+                print(f"[warn] {type(e).__name__} => wait {wait}s, retry {url}...")
                 time.sleep(wait)
                 attempt += 1
             else:
@@ -81,16 +72,17 @@ def robust_fetch(url, session, max_retries=3):
                 return None
     return None
 
-def get_listing_links(page, session):
-    url = LISTING_URL_TEMPLATE.format(page=page)
+def get_listing_links(page_number, session):
+    """Return up to 16 product links from the listing page. If none => []."""
+    url = LISTING_URL_TEMPLATE.format(page=page_number)
     resp = robust_fetch(url, session)
     if not resp or not resp.ok:
         return []
     tree = html.fromstring(resp.text)
 
-    # check if product-result-1 found => if not => no more
-    first = tree.xpath('//main[@id="main-content"]//a[@data-testid="product-result-1"]/@href')
-    if not first:
+    first_sel = '//main[@id="main-content"]//a[@data-testid="product-result-1"]/@href'
+    first_link = tree.xpath(first_sel)
+    if not first_link:
         return []
 
     links = []
@@ -99,12 +91,13 @@ def get_listing_links(page, session):
         found = tree.xpath(xp)
         if found:
             links.extend(found)
+
     abs_links = [urljoin(BASE_URL, ln) for ln in links]
     return abs_links
 
-def parse_detail(url, session):
+def parse_detail(detail_url, session):
     record = {
-        "url": url,
+        "url": detail_url,
         "title": None,
         "subtitle": None,
         "financial_lease_price": None,
@@ -120,31 +113,29 @@ def parse_detail(url, session):
         "btw_marge": None,
         "opties_accessoires": None,
         "address": None,
-        "images": []
+        "images": [],
     }
-    resp = robust_fetch(url, session)
+    resp = robust_fetch(detail_url, session)
     if not resp or not resp.ok:
-        print(f"[error] Cannot fetch detail => {url}")
+        print(f"[error] Cannot fetch detail => {detail_url}")
         return None
 
     tree = html.fromstring(resp.text)
-    def t(xp):
-        return tree.xpath(xp)
+    t = lambda xp: tree.xpath(xp)
 
-    # Title, subtitle, fl price, term
+    # Title / subtitle
     title = t('//h1[@class="h1-sm tablet:h1 text-trustful-1"]/text()')
-    record["title"] = title[0].strip() if title else None
+    if title: record["title"] = title[0].strip()
 
-    subtitle = t('//p[@class="type-auto-sm tablet:type-auto-m text-trustful-1"]/text()')
-    record["subtitle"] = subtitle[0].strip() if subtitle else None
+    subt = t('//p[@class="type-auto-sm tablet:type-auto-m text-trustful-1"]/text()')
+    if subt: record["subtitle"] = subt[0].strip()
 
     flp = t('//div[@data-testid="price-block"]//h2/text()')
-    record["financial_lease_price"] = flp[0].strip() if flp else None
+    if flp: record["financial_lease_price"] = flp[0].strip()
 
     flt = t('//div[@data-testid="price-block"]//p[contains(@class,"info-sm") and contains(text(),"mnd")]/text()')
-    record["financial_lease_term"] = flt[0].strip() if flt else None
+    if flt: record["financial_lease_term"] = flt[0].strip()
 
-    # Advertentienummer
     adnum = t('//div[contains(@class,"p-sm") and contains(text(),"Advertentienummer")]/text()')
     if adnum:
         record["advertentienummer"] = adnum[0].split(":",1)[-1].strip()
@@ -163,19 +154,19 @@ def parse_detail(url, session):
     record["brandstof"] = spec("Brandstof")
     record["btw_marge"] = spec("Btw/marge")
 
-    # Opties & accessoires
+    # Opties & Accessoires
     oa = t('//h2[contains(.,"Opties & Accessoires")]/following-sibling::ul/li/text()')
     if oa:
         cleaned = [x.strip() for x in oa if x.strip()]
         record["opties_accessoires"] = ", ".join(cleaned)
 
-    # Address
-    addr = t('//div[@class="flex justify-between"]/div/p[@class="text-p-sm font-light text-black tablet:text-p"]/text()')
+    addr_sel = '//div[@class="flex justify-between"]/div/p[@class="text-p-sm font-light text-black tablet:text-p"]/text()'
+    addr = t(addr_sel)
     if addr:
         record["address"] = addr[0].strip()
 
-    # Images
-    imgs = t('//ul[@class="swiper-wrapper pb-10"]/li/img/@src')
+    img_sel = '//ul[@class="swiper-wrapper pb-10"]/li/img/@src'
+    imgs = t(img_sel)
     if imgs:
         for i in imgs:
             if i.startswith("/"):
@@ -184,125 +175,106 @@ def parse_detail(url, session):
 
     return record
 
-# ---------- MAIN ------------
 def main():
-    print("[info] Starting DTC scraper...")
-
+    print("[info] Starting DTC scraper (Render version) ...")
     session = requests.Session()
-    session.headers.update(HEADERS)
 
     all_listings = []
-
-    seen_linksets = set()
-    repeated_pages = 0
-
     page = 1
     while True:
-        if page > MAX_PAGES:
-            print(f"[warn] Reached page {page} > {MAX_PAGES} => stop scraping.")
-            break
-
         print(f"[info] Listing page {page} ...")
         links = get_listing_links(page, session)
         if not links:
-            print("[info] No more links => stop pagination.")
+            print(f"[info] No links found on page {page} => stop.")
             break
 
         print(f"[info] Found {len(links)} links on page {page}.")
-        linkset = frozenset(links)
-        if linkset in seen_linksets:
-            repeated_pages += 1
-            print(f"[warn] This page's links were already seen => repeated_pages={repeated_pages}")
-            if repeated_pages >= MAX_REPEAT_THRESHOLD:
-                print("[warn] Repeated pages threshold reached => stop pagination.")
-                break
-        else:
-            repeated_pages = 0
-            seen_linksets.add(linkset)
-
-        # Now parse each listing
-        for idx, ln in enumerate(links, start=1):
+        for ln in links:
             print(f"   -> detail: {ln}")
             rec = parse_detail(ln, session)
             if rec:
                 all_listings.append(rec)
-            time.sleep(1)  # small delay per detail
+            time.sleep(1)
 
         page += 1
-        time.sleep(2)  # small delay per page
+        if page > 100:
+            print("[warn] Reached 100 pages => stopping.")
+            break
+        time.sleep(2)
 
-    print(f"[info] Total listings scraped: {len(all_listings)}")
+    total_scraped = len(all_listings)
+    print(f"[info] Total listings scraped: {total_scraped}")
 
-    if not all_listings:
-        print("[error] No data scraped => skip DB update.")
-        sys.exit(1)
+    if total_scraped == 0:
+        print("[warn] Scraped 0 listings. NOT wiping old DB data. Done.")
+        sys.exit(0)
 
+    # If we have some data, connect to DB and do the TRUNCATE + re-insert
     try:
         conn = connect_db()
         cur = conn.cursor()
 
-        # TRUNCATE existing data
         print("[info] Clearing old data in DB (car_images + car_listings)...")
+        # We'll only do this because we have new data
         cur.execute("TRUNCATE car_images;")
         cur.execute("TRUNCATE car_listings RESTART IDENTITY CASCADE;")
         conn.commit()
 
-        # Insert new
         print("[info] Inserting new records...")
-        insert_cl = """
+        insert_listings_sql = """
         INSERT INTO car_listings (
             url, title, subtitle, financial_lease_price, financial_lease_term,
             advertentienummer, merk, model, bouwjaar, km_stand,
-            transmissie, prijs, brandstof, btw_marge, opties_accessoires, address
+            transmissie, prijs, brandstof, btw_marge, opties_accessoires,
+            address
         )
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id;
         """
-        insert_ci = """
+        insert_images_sql = """
         INSERT INTO car_images (image_url, car_listing_id)
         VALUES (%s, %s);
         """
 
-        count_inserted = 0
-        for item in all_listings:
-            cur.execute(insert_cl, (
-                item["url"],
-                item["title"],
-                item["subtitle"],
-                item["financial_lease_price"],
-                item["financial_lease_term"],
-                item["advertentienummer"],
-                item["merk"],
-                item["model"],
-                item["bouwjaar"],
-                item["km_stand"],
-                item["transmissie"],
-                item["prijs"],
-                item["brandstof"],
-                item["btw_marge"],
-                item["opties_accessoires"],
-                item["address"]
+        inserted_count = 0
+        for listing in all_listings:
+            cur.execute(insert_listings_sql, (
+                listing["url"],
+                listing["title"],
+                listing["subtitle"],
+                listing["financial_lease_price"],
+                listing["financial_lease_term"],
+                listing["advertentienummer"],
+                listing["merk"],
+                listing["model"],
+                listing["bouwjaar"],
+                listing["km_stand"],
+                listing["transmissie"],
+                listing["prijs"],
+                listing["brandstof"],
+                listing["btw_marge"],
+                listing["opties_accessoires"],
+                listing["address"]
             ))
             new_id = cur.fetchone()[0]
 
-            # Insert image rows
-            if item["images"]:
-                for img_url in item["images"]:
-                    cur.execute(insert_ci, (img_url, new_id))
+            # Insert images
+            for img_url in listing["images"]:
+                cur.execute(insert_images_sql, (img_url, new_id))
 
-            count_inserted += 1
+            inserted_count += 1
 
         conn.commit()
-        print(f"[info] Inserted {count_inserted} listings into DB successfully!")
-
+        print(f"[info] Inserted {inserted_count} listings into DB successfully!")
     except Exception as e:
         print(f"[error] DB error => {e}")
         sys.exit(1)
     finally:
-        if 'cur' in locals(): cur.close()
-        if 'conn' in locals(): conn.close()
+        if 'cur' in locals():
+            cur.close()
+        if 'conn' in locals():
+            conn.close()
         print("[info] DB connection closed.")
-
 
 if __name__ == "__main__":
     main()
