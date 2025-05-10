@@ -8,12 +8,6 @@ from lxml import html
 from urllib.parse import urljoin
 
 BASE_URL = "https://www.dtc-lease.nl"
-LISTING_URL_TEMPLATE = (
-    "https://www.dtc-lease.nl/voorraad"
-    "?lease_type=financial"
-    "&voertuigen%5Bpage%5D={page}"
-    "&voertuigen%5BsortBy%5D=voertuigen_created_at_desc"
-)
 
 HEADERS = {
     "User-Agent": (
@@ -24,7 +18,7 @@ HEADERS = {
     "Accept": "*/*",
 }
 
-# Pull DB credentials from environment or fallback:
+# Pull DB credentials from environment or fallback defaults
 DB_NAME = os.getenv("DB_NAME", "neolease_db")
 DB_USER = os.getenv("DB_USER", "neolease_db_user")
 DB_PASS = os.getenv("DB_PASS", "DKuNZ0Z4OhuNKWvEFaAuWINgr7BfgyTE")
@@ -42,7 +36,10 @@ def connect_db():
     )
 
 def robust_fetch(url, session, max_retries=4):
-    """Fetch the URL with retry/backoff logic."""
+    """
+    Fetch the URL with retry/backoff logic for status 403/429 or Connection/Timeout errors.
+    Returns `requests.Response` or None if all retries fail.
+    """
     backoffs = [10, 30, 60, 120]
     attempt = 0
     while attempt < max_retries:
@@ -73,22 +70,47 @@ def robust_fetch(url, session, max_retries=4):
                 return None
     return None
 
-def get_listing_links(page_number, session):
-    """Return up to 16 product links from the listing page. If none => []."""
-    url = LISTING_URL_TEMPLATE.format(page=page_number)
+def get_brand_links(session):
+    """
+    Scrape the /merken page to get all the brand/model "listing" links.
+    (E.g. https://www.dtc-lease.nl/voorraad/audi/a1?lease_type=financial&entity=business).
+    """
+    url = urljoin(BASE_URL, "/merken")
     resp = robust_fetch(url, session)
+    if not resp or not resp.ok:
+        print(f"[error] Cannot fetch brand list => {url}")
+        return []
+
+    tree = html.fromstring(resp.text)
+    # XPath for brand/model links:
+    xp = '//main[@id="main-content"]//ul/li[@class="text-cta-1 ml-6 list-disc"]/a/@href'
+    found_links = tree.xpath(xp)
+
+    # Convert to absolute URLs:
+    abs_links = [urljoin(BASE_URL, ln) for ln in found_links]
+    return abs_links
+
+def get_listing_links(page_url, session):
+    """
+    Given a brand/model listing URL (including &page=X if needed),
+    return up to 16 product links from that page.
+    If none => [], meaning "stop" for that brand/model.
+    """
+    resp = robust_fetch(page_url, session)
     if not resp or not resp.ok:
         return []
 
     tree = html.fromstring(resp.text)
-    # Quick check to see if there's at least a 'product-result-1'
+    # Check if there's at least a 'product-result-1'
     first_sel = '//main[@id="main-content"]//a[@data-testid="product-result-1"]/@href'
     first_link = tree.xpath(first_sel)
     if not first_link:
         return []
 
     links = []
-    for i in range(0, 16):
+    # data-testid="product-result-0" through -16, etc. 
+    # But typically they start at 1. We'll check 1..16
+    for i in range(1, 17):
         xp = f'//main[@id="main-content"]//a[@data-testid="product-result-{i}"]/@href'
         found = tree.xpath(xp)
         if found:
@@ -98,6 +120,10 @@ def get_listing_links(page_number, session):
     return abs_links
 
 def parse_detail(detail_url, session):
+    """
+    Parse a single detail page, returning a dict with all relevant fields.
+    If fails => return None.
+    """
     record = {
         "url": detail_url,
         "title": None,
@@ -191,103 +217,143 @@ def main():
     print("[info] Starting DTC scraper (Render version) ...")
     session = requests.Session()
 
-    all_listings = []
-    page = 1
-    while True:
-        print(f"[info] Listing page {page} ...")
-        links = get_listing_links(page, session)
-        if not links:
-            print(f"[info] No links found on page {page} => stop.")
-            break
+    # 1) Gather all brand/model listing links
+    brand_links = get_brand_links(session)
+    print(f"[info] Found {len(brand_links)} brand-model listing links.")
 
-        print(f"[info] Found {len(links)} links on page {page}.")
-        for ln in links:
-            print(f"   -> detail: {ln}")
-            rec = parse_detail(ln, session)
-            if rec:
-                all_listings.append(rec)
-            time.sleep(1)
+    # 2) Collect all detail-page URLs from all brand links (with pagination)
+    all_scraped_urls = set()
+    for brand_link in brand_links:
+        page = 1
+        while True:
+            if page == 1:
+                page_url = brand_link
+            else:
+                page_url = f"{brand_link}&page={page}"
 
-        page += 1
-        if page > 100:
-            print("[warn] Reached 100 pages => stopping.")
-            break
-        time.sleep(2)
+            print(f"[info] Fetching listing page => {page_url}")
+            links = get_listing_links(page_url, session)
+            if not links:
+                print(f"[info] No links found on page {page}. Stop pagination for {brand_link}.")
+                break
 
-    total_scraped = len(all_listings)
-    print(f"[info] Total listings scraped: {total_scraped}")
+            for ln in links:
+                all_scraped_urls.add(ln)
 
-    if total_scraped == 0:
-        print("[warn] Scraped 0 listings. NOT wiping old DB data. Done.")
-        sys.exit(0)
+            print(f"[info] Found {len(links)} product links on page {page} (so far total {len(all_scraped_urls)})")
 
-    # Connect to DB + insert
+            page += 1
+            # Safety check to avoid infinite loops:
+            if page > 100:
+                print("[warn] Reached 100 pages => stopping pagination for this brand/model.")
+                break
+
+            # Short delay between pages
+            time.sleep(2)
+
+    print(f"[info] Final total unique detail URLs scraped: {len(all_scraped_urls)}")
+
+    # 3) Connect to DB and figure out which are "new" vs. "obsolete" vs. overlap
     try:
         conn = connect_db()
         cur = conn.cursor()
 
-        print("[info] Clearing old data in DB (car_images + car_listings)...")
-        cur.execute("TRUNCATE car_images;")
-        cur.execute("TRUNCATE car_listings RESTART IDENTITY CASCADE;")
-        conn.commit()
+        # Fetch existing detail URLs from DB
+        cur.execute("SELECT url FROM car_listings;")
+        rows = cur.fetchall()
+        existing_db_urls = set(r[0] for r in rows)
+        print(f"[info] Currently have {len(existing_db_urls)} URLs in DB.")
 
-        print("[info] Inserting new records...")
+        # Determine new and obsolete
+        new_urls = all_scraped_urls - existing_db_urls
+        obsolete_urls = existing_db_urls - all_scraped_urls
+        overlap = all_scraped_urls & existing_db_urls
 
-        insert_listings_sql = """
-        INSERT INTO car_listings (
-            url, title, subtitle, financial_lease_price, financial_lease_term,
-            advertentienummer, merk, model, bouwjaar, km_stand,
-            transmissie, prijs, brandstof, btw_marge, opties_accessoires,
-            address
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        RETURNING id;
-        """
+        print(f"[info] Overlap: {len(overlap)} URLs (no action needed).")
+        print(f"[info] New: {len(new_urls)} URLs (need to scrape + insert).")
+        print(f"[info] Obsolete: {len(obsolete_urls)} URLs (will delete).")
 
-        insert_images_sql = """
-        INSERT INTO car_images (image_url, car_listing_id)
-        VALUES (%s, %s);
-        """
+        # 3A) DELETE obsolete URLs
+        # This also should cascade-delete rows in car_images if you have FK with ON DELETE CASCADE
+        # Otherwise, manually delete from car_images first if needed.
+        if obsolete_urls:
+            print("[info] Deleting obsolete URLs from DB...")
+            # Convert set -> list to pass to execute
+            cur.execute(
+                "DELETE FROM car_listings WHERE url = ANY(%s)",
+                (list(obsolete_urls),)
+            )
+            conn.commit()
+            print(f"[info] Deleted {cur.rowcount} obsolete car_listings.")
 
-        inserted_count = 0
+        # 3B) SCRAPE + INSERT for new URLs only
+        if new_urls:
+            print("[info] Scraping detail data for new URLs and inserting into DB...")
+            insert_listings_sql = """
+                INSERT INTO car_listings (
+                    url, title, subtitle, financial_lease_price, financial_lease_term,
+                    advertentienummer, merk, model, bouwjaar, km_stand,
+                    transmissie, prijs, brandstof, btw_marge, opties_accessoires,
+                    address
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id;
+            """
 
-        for listing in all_listings:
-            try:
-                # Insert the car_listings record
-                cur.execute(insert_listings_sql, (
-                    listing["url"],
-                    listing["title"],
-                    listing["subtitle"],
-                    listing["financial_lease_price"],
-                    listing["financial_lease_term"],
-                    listing["advertentienummer"],
-                    listing["merk"],
-                    listing["model"],
-                    listing["bouwjaar"],
-                    listing["km_stand"],
-                    listing["transmissie"],
-                    listing["prijs"],
-                    listing["brandstof"],
-                    listing["btw_marge"],
-                    listing["opties_accessoires"],
-                    listing["address"]
-                ))
-                new_id = cur.fetchone()[0]
+            insert_images_sql = """
+                INSERT INTO car_images (image_url, car_listing_id)
+                VALUES (%s, %s);
+            """
 
-                # Insert car_images
-                for img_url in listing["images"]:
-                    cur.execute(insert_images_sql, (img_url, new_id))
+            inserted_count = 0
+            # We'll use a dedicated session for detail scraping
+            detail_session = requests.Session()
 
-                # Commit this single listing successfully
-                conn.commit()
-                inserted_count += 1
+            for url in new_urls:
+                print(f"[info] Parsing detail for new URL => {url}")
+                rec = parse_detail(url, detail_session)
+                if not rec:
+                    # skip if parse failed
+                    continue
 
-            except Exception as insert_err:
-                print(f"[error] Insert failed for {listing['url']} => {insert_err}")
-                conn.rollback()
-                continue
+                try:
+                    cur.execute(insert_listings_sql, (
+                        rec["url"],
+                        rec["title"],
+                        rec["subtitle"],
+                        rec["financial_lease_price"],
+                        rec["financial_lease_term"],
+                        rec["advertentienummer"],
+                        rec["merk"],
+                        rec["model"],
+                        rec["bouwjaar"],
+                        rec["km_stand"],
+                        rec["transmissie"],
+                        rec["prijs"],
+                        rec["brandstof"],
+                        rec["btw_marge"],
+                        rec["opties_accessoires"],
+                        rec["address"]
+                    ))
+                    new_id = cur.fetchone()[0]
 
-        print(f"[info] Inserted {inserted_count} listings into DB successfully!")
+                    # Insert images
+                    for img_url in rec["images"]:
+                        cur.execute(insert_images_sql, (img_url, new_id))
+
+                    conn.commit()
+                    inserted_count += 1
+
+                except Exception as insert_err:
+                    print(f"[error] Insert failed for {url} => {insert_err}")
+                    conn.rollback()
+
+                # Small delay to be polite
+                time.sleep(1)
+
+            print(f"[info] Inserted {inserted_count} new listings into DB.")
+        else:
+            print("[info] No new URLs to insert.")
 
     except Exception as e:
         print(f"[error] DB error => {e}")
@@ -298,6 +364,8 @@ def main():
         if 'conn' in locals():
             conn.close()
         print("[info] DB connection closed.")
+
+    print("[info] Scraper finished successfully.")
 
 if __name__ == "__main__":
     main()
