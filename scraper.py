@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-import sys, os, time, requests, psycopg2, psycopg2.extras, concurrent.futures
+"""
+Fast DTC-Lease scraper for Render Cron
+– 10-thread pagination (Phase 1)
+– 10-thread detail scraping (Phase 3)
+– Bulk DB insert
+Hard-coded DB creds (same as legacy script).
+"""
+import sys, os, time, threading, requests, psycopg2, psycopg2.extras, concurrent.futures
 from urllib.parse import urljoin
 from lxml import html
 
@@ -14,8 +21,9 @@ HEADERS = {
     ),
     "Accept": "*/*",
 }
+WORKERS = 10        # number of concurrent threads for both phases
 
-# hard-coded DB creds (same as your previous script)
+# Hard-coded DB creds (legacy style)
 DB_NAME = "neolease_db"
 DB_USER = "neolease_db_user"
 DB_PASS = "DKuNZ0Z4OhuNKWvEFaAuWINgr7BfgyTE"
@@ -26,7 +34,6 @@ DB_PORT = "5432"
 # DB CONNECTION
 # ────────────────────────────────────────────────────────────────────────────
 def connect_db():
-    """Connect with hard-coded credentials."""
     return psycopg2.connect(
         dbname=DB_NAME,
         user=DB_USER,
@@ -77,6 +84,38 @@ def get_listing_links(page_url, session):
     for i in range(1, 17):
         links += tree.xpath(f'//a[@data-testid="product-result-{i}"]/@href')
     return [urljoin(BASE_URL, ln) for ln in links]
+
+# ────────────────────────────────────────────────────────────────────────────
+# PHASE 1: PARALLEL COLLECTION OF DETAIL URLs
+# ────────────────────────────────────────────────────────────────────────────
+def scrape_one_brand(brand_link, out_set, lock):
+    """Walk all pages for one brand-model link and push detail URLs into shared set."""
+    session = requests.Session()
+    page = 1
+    while True:
+        page_url = f"{brand_link}&page={page}" if page > 1 else brand_link
+        links = get_listing_links(page_url, session)
+        if not links:
+            break
+        with lock:
+            out_set.update(links)
+        page += 1
+        if page > 100:
+            break
+        time.sleep(0.5)            # polite delay
+    print(f"[phase1] done: {brand_link}")
+
+def collect_detail_urls():
+    """Return a set of ALL detail URLs using WORKERS threads."""
+    sess = requests.Session()
+    brand_links = get_brand_links(sess)
+    print(f"[phase1] {len(brand_links)} brand-model listing links")
+    all_urls, lock = set(), threading.Lock()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        futures = [pool.submit(scrape_one_brand, bl, all_urls, lock) for bl in brand_links]
+        concurrent.futures.wait(futures)
+    print(f"[phase1] total detail URLs = {len(all_urls)}")
+    return all_urls
 
 # ────────────────────────────────────────────────────────────────────────────
 # DETAIL PARSER
@@ -132,27 +171,12 @@ def parse_detail(detail_url):
 # MAIN
 # ────────────────────────────────────────────────────────────────────────────
 def main():
-    print("[info] Newer 12 may DTC cron scraper starting …")
-    session = requests.Session()
+    print("[info] DTC cron scraper starting …")
 
-    # Phase 1 – gather all detail URLs
-    brand_links = get_brand_links(session)
-    all_urls = set()
-    for bl in brand_links:
-        page = 1
-        while True:
-            page_url = f"{bl}&page={page}" if page > 1 else bl
-            links = get_listing_links(page_url, session)
-            if not links:
-                break
-            all_urls.update(links)
-            page += 1
-            if page > 100:
-                break
-            time.sleep(1)
-    print(f"[info] total detail URLs found = {len(all_urls)}")
+    # ---------- Phase 1 : parallel build of URL universe ----------
+    all_urls = collect_detail_urls()
 
-    # Phase 2 – diff vs DB
+    # ---------- Phase 2 : DB diff ----------
     conn = connect_db()
     cur = conn.cursor()
     cur.execute("SELECT url FROM car_listings;")
@@ -170,14 +194,15 @@ def main():
         conn.commit()
         print(f"[info] deleted {cur.rowcount} obsolete listings")
 
-    # Phase 3 – parallel scrape new detail pages
+    # ---------- Phase 3 : parallel detail scraping ----------
     if new_urls:
         print("[info] scraping new URLs in parallel …")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
             records = list(pool.map(parse_detail, new_urls))
         records = [r for r in records if r]
         print(f"[info] successfully parsed {len(records)} new records")
 
+        # ---------- Phase 4 : bulk insert listings ----------
         if records:
             listing_tuples = [
                 (
@@ -203,6 +228,7 @@ def main():
             )
             new_ids = [row[0] for row in cur.fetchall()]
 
+            # ---------- Phase 5 : bulk insert images ----------
             image_rows = []
             for rec, listing_id in zip(records, new_ids):
                 image_rows.extend([(img, listing_id) for img in rec["images"]])
@@ -222,5 +248,4 @@ def main():
     print("[info] scraper finished OK")
 
 if __name__ == "__main__":
-    print('newer version')
     main()
