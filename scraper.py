@@ -132,7 +132,7 @@ def parse_detail(detail_url):
 # MAIN
 # ────────────────────────────────────────────────────────────────────────────
 def main():
-    print("[info] DTC cron scraper starting …")
+    print("[info] Newer 12 may DTC cron scraper starting …")
     session = requests.Session()
 
     # Phase 1 – gather all detail URLs
