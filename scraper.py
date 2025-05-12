@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-import os, sys, time, requests, psycopg2, psycopg2.extras, concurrent.futures
+import sys, os, time, requests, psycopg2, psycopg2.extras, concurrent.futures
 from urllib.parse import urljoin
 from lxml import html
 
+# ────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+# ────────────────────────────────────────────────────────────────────────────
 BASE_URL = "https://www.dtc-lease.nl"
 HEADERS = {
     "User-Agent": (
@@ -12,26 +15,28 @@ HEADERS = {
     "Accept": "*/*",
 }
 
+# hard-coded DB creds (same as your previous script)
+DB_NAME = "neolease_db"
+DB_USER = "neolease_db_user"
+DB_PASS = "DKuNZ0Z4OhuNKWvEFaAuWINgr7BfgyTE"
+DB_HOST = "dpg-cvslkuvdiees73fiv97g-a.oregon-postgres.render.com"
+DB_PORT = "5432"
+
 # ────────────────────────────────────────────────────────────────────────────
-# DB CONNECTION HELPERS
+# DB CONNECTION
 # ────────────────────────────────────────────────────────────────────────────
 def connect_db():
-    """Use DATABASE_URL if present; else fall back to individual vars."""
-    db_url = os.getenv("DATABASE_URL")
-    if db_url:
-        return psycopg2.connect(db_url, sslmode="require")
-    # fall-back (legacy env vars)
+    """Connect with hard-coded credentials."""
     return psycopg2.connect(
-        dbname=os.getenv("DB_NAME", "neolease_db"),
-        user=os.getenv("DB_USER", "neolease_db_user"),
-        password=os.getenv("DB_PASS"),
-        host=os.getenv("DB_HOST"),
-        port=os.getenv("DB_PORT", "5432"),
-        sslmode="require",
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS,
+        host=DB_HOST,
+        port=DB_PORT
     )
 
 # ────────────────────────────────────────────────────────────────────────────
-# HTTP HELPERS (unchanged)
+# HTTP HELPERS
 # ────────────────────────────────────────────────────────────────────────────
 def robust_fetch(url, session, max_retries=4):
     backoff = [10, 30, 60, 120]
@@ -70,13 +75,11 @@ def get_listing_links(page_url, session):
         return []
     links = []
     for i in range(1, 17):
-        links += tree.xpath(
-            f'//a[@data-testid="product-result-{i}"]/@href'
-        )
+        links += tree.xpath(f'//a[@data-testid="product-result-{i}"]/@href')
     return [urljoin(BASE_URL, ln) for ln in links]
 
 # ────────────────────────────────────────────────────────────────────────────
-# DETAIL-PAGE PARSER (unchanged logic, returns dict)
+# DETAIL PARSER
 # ────────────────────────────────────────────────────────────────────────────
 def parse_detail(detail_url):
     session = requests.Session()
@@ -99,15 +102,10 @@ def parse_detail(detail_url):
             t('//div[@data-testid="price-block"]//h2/text()') or [None]
         )[0],
         "financial_lease_term": (
-            t(
-                '//div[@data-testid="price-block"]//p[contains(@class,"info-sm") and '
-                'contains(text(),"mnd")]/text()'
-            )
-            or [None]
+            t('//div[@data-testid="price-block"]//p[contains(@class,"info-sm") and contains(text(),"mnd")]/text()') or [None]
         )[0],
         "advertentienummer": (
-            t('//div[contains(@class,"p-sm") and contains(text(),"Advertentienummer")]/text()')
-            or [None]
+            t('//div[contains(@class,"p-sm") and contains(text(),"Advertentienummer")]/text()') or [None]
         )[0],
         "merk": spec("Merk"),
         "model": spec("Model"),
@@ -119,14 +117,9 @@ def parse_detail(detail_url):
         "btw_marge": spec("Btw/marge"),
         "opties_accessoires": ", ".join(
             [x.strip() for x in t('//h2[contains(.,"Opties")]/following-sibling::ul/li/text()')]
-        )
-        or None,
+        ) or None,
         "address": (
-            t(
-                '//div[@class="flex justify-between"]/div/p[@class="text-p-sm '
-                'font-light text-black tablet:text-p"]/text()'
-            )
-            or [None]
+            t('//div[@class="flex justify-between"]/div/p[@class="text-p-sm font-light text-black tablet:text-p"]/text()') or [None]
         )[0],
         "images": [
             urljoin(BASE_URL, src) if src.startswith("/") else src
@@ -140,15 +133,16 @@ def parse_detail(detail_url):
 # ────────────────────────────────────────────────────────────────────────────
 def main():
     print("[info] DTC cron scraper starting …")
-    # ---------- Phase 1 : build up the URL universe ----------
-    s = requests.Session()
-    brand_links = get_brand_links(s)
+    session = requests.Session()
+
+    # Phase 1 – gather all detail URLs
+    brand_links = get_brand_links(session)
     all_urls = set()
     for bl in brand_links:
         page = 1
         while True:
             page_url = f"{bl}&page={page}" if page > 1 else bl
-            links = get_listing_links(page_url, s)
+            links = get_listing_links(page_url, session)
             if not links:
                 break
             all_urls.update(links)
@@ -156,10 +150,9 @@ def main():
             if page > 100:
                 break
             time.sleep(1)
-
     print(f"[info] total detail URLs found = {len(all_urls)}")
 
-    # ---------- Phase 2 : DB diff ----------
+    # Phase 2 – diff vs DB
     conn = connect_db()
     cur = conn.cursor()
     cur.execute("SELECT url FROM car_listings;")
@@ -172,41 +165,27 @@ def main():
         f"obsolete={len(obsolete_urls)}"
     )
 
-    # delete obsolete (CASCADE handles images)
     if obsolete_urls:
         cur.execute("DELETE FROM car_listings WHERE url = ANY(%s)", (obsolete_urls,))
         conn.commit()
         print(f"[info] deleted {cur.rowcount} obsolete listings")
 
-    # ---------- Phase 3 : parallel detail scraping ----------
+    # Phase 3 – parallel scrape new detail pages
     if new_urls:
         print("[info] scraping new URLs in parallel …")
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
             records = list(pool.map(parse_detail, new_urls))
-
-        records = [r for r in records if r]  # drop failed
+        records = [r for r in records if r]
         print(f"[info] successfully parsed {len(records)} new records")
 
-        # ---------- Phase 4 : bulk insert listings ----------
         if records:
             listing_tuples = [
                 (
-                    r["url"],
-                    r["title"],
-                    r["subtitle"],
-                    r["financial_lease_price"],
-                    r["financial_lease_term"],
-                    r["advertentienummer"],
-                    r["merk"],
-                    r["model"],
-                    r["bouwjaar"],
-                    r["km_stand"],
-                    r["transmissie"],
-                    r["prijs"],
-                    r["brandstof"],
-                    r["btw_marge"],
-                    r["opties_accessoires"],
-                    r["address"],
+                    r["url"], r["title"], r["subtitle"], r["financial_lease_price"],
+                    r["financial_lease_term"], r["advertentienummer"], r["merk"],
+                    r["model"], r["bouwjaar"], r["km_stand"], r["transmissie"],
+                    r["prijs"], r["brandstof"], r["btw_marge"],
+                    r["opties_accessoires"], r["address"]
                 )
                 for r in records
             ]
@@ -224,16 +203,13 @@ def main():
             )
             new_ids = [row[0] for row in cur.fetchall()]
 
-            # ---------- Phase 5 : bulk insert images ----------
             image_rows = []
             for rec, listing_id in zip(records, new_ids):
                 image_rows.extend([(img, listing_id) for img in rec["images"]])
 
             if image_rows:
                 insert_imgs = "INSERT INTO car_images (image_url, car_listing_id) VALUES %s"
-                psycopg2.extras.execute_values(
-                    cur, insert_imgs, image_rows, page_size=1000
-                )
+                psycopg2.extras.execute_values(cur, insert_imgs, image_rows, page_size=1000)
 
             conn.commit()
             print(
@@ -244,7 +220,6 @@ def main():
     cur.close()
     conn.close()
     print("[info] scraper finished OK")
-
 
 if __name__ == "__main__":
     main()
