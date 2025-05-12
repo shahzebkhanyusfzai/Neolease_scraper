@@ -222,4 +222,5 @@ def main():
     print("[info] scraper finished OK")
 
 if __name__ == "__main__":
+    print('newer version')
     main()
