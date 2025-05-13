@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-DTC-Lease scraper  –  10-slice workers, batched inserts
-* span-based pagination
-* PARSE_CHUNK = 2 000 URLs  |  LISTING_CHUNK = 2 000 rows  |  IMAGE_CHUNK = 10 000 rows
-* Strings are clipped to column width to avoid VARCHAR truncation errors
-* Front-end JS hides any 404 images — no server-side filtering
+DTC-Lease scraper  –  10-slice collectors, batched inserts.
+• span-based pagination
+• PARSE_CHUNK   = 2 000 URLs fetched & parsed at a time
+• LISTING_CHUNK = 2 000 rows pushed into Postgres per execute_values()
+• IMAGE_CHUNK   = 10 000 image rows per execute_values()
+• If *any* record fails to insert it is skipped and logged – scraper keeps going.
+• No server-side image 404 checking (handled on front-end).
 """
 
-import math, re, time, gc, os, concurrent.futures, requests
-import psycopg2, psycopg2.extras
+import math, re, time, gc, os, logging, concurrent.futures, requests
+import psycopg2, psycopg2.extras, psycopg2.errors
 from urllib.parse import urljoin
 from lxml import html
 
@@ -21,37 +23,26 @@ PARSE_CHUNK   = 2_000
 LISTING_CHUNK = 2_000
 IMAGE_CHUNK   = 10_000
 
-DB_NAME = "neolease_db_kpz9"
-DB_USER = "neolease_db_kpz9_user"
-DB_PASS = "33H6QVFnAouvau72DlSjuKAMe5GdfviD"
-DB_HOST = "dpg-d0f0ihh5pdvs73b6h3bg-a.oregon-postgres.render.com"
-DB_PORT = "5432"
+DB_DSN = (
+    "dbname=neolease_db_kpz9 "
+    "user=neolease_db_kpz9_user "
+    "password=33H6QVFnAouvau72DlSjuKAMe5GdfviD "
+    "host=dpg-d0f0ihh5pdvs73b6h3bg-a.oregon-postgres.render.com "
+    "port=5432 sslmode=require"
+)
 
-# --- optional RAM meter (will show -1 MB if psutil absent) -------------
+# optional RAM meter (shows -1 MB if psutil missing)
 try:
     import psutil
     mem_mb = lambda: psutil.Process(os.getpid()).memory_info().rss // 1_048_576
 except ImportError:
     mem_mb = lambda: -1
 
-# ───────────────────────── CLIP helper ─────────────────────────
-# hard limits of the columns in your schema
-LIMIT = {
-    "url": 200,
-    "title": 160,
-    "subtitle": 240,
-    "address": 240
-}
-def clip(val, field):
-    lim = LIMIT.get(field)
-    return val[:lim] if lim and isinstance(val, str) and val else val
-
-# ───────────────────────── DB helper ─────────────────────────
-def db():
-    return psycopg2.connect(
-        dbname=DB_NAME, user=DB_USER, password=DB_PASS,
-        host=DB_HOST, port=DB_PORT, sslmode="require"
-    )
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s",
+    datefmt="%H:%M:%S"
+)
 
 # ───────────────────────── HTTP helpers ─────────────────────────
 def http(url, sess, tries=3):
@@ -67,8 +58,9 @@ def http(url, sess, tries=3):
 
 def total_results(tree):
     txt = tree.xpath('//span[contains(text(),"Toon resultaten")]/text()')
-    m   = re.search(r'\((\d+)\)', txt[0]) if txt else None
-    return int(m.group(1)) if m else None
+    if txt and (m := re.search(r'\((\d+)\)', txt[0])):
+        return int(m.group(1))
+    return None
 
 def list_links(tree):
     out=[]
@@ -76,77 +68,82 @@ def list_links(tree):
         out += tree.xpath(f'//a[@data-testid="product-result-{i}"]/@href')
     return [urljoin(BASE_URL,u) for u in out]
 
-# ───────────────────────── SLICE worker ─────────────────────────
+# ───────────────────────── SLICE worker – collects URLs ─────────────────────────
 def slice_worker(idx, brands):
     sess = requests.Session()
-    all_links = set()
+    urls = set()
 
     for b in brands:
-        base = f"{b}?lease_type=financial&entity=business"
-        r = http(base, sess); pages=cars=0
+        base=f"{b}?lease_type=financial&entity=business"
+        r=http(base,sess); pages=cars=0
         if not r: continue
 
-        tree = html.fromstring(r.text)
-        L = list_links(tree); all_links.update(L)
+        tree=html.fromstring(r.text)
+        L=list_links(tree); urls.update(L)
         pages+=1; cars+=len(L)
-
         max_p = math.ceil(total_results(tree)/16) if total_results(tree) else None
         p=1
         while True:
             p+=1
             if max_p and p>max_p: break
-            r = http(f"{base}&page={p}", sess)
+            r=http(f"{base}&page={p}",sess)
             if not r or 'product-result-1' not in r.text: break
-            L = list_links(html.fromstring(r.text))
+            L=list_links(html.fromstring(r.text))
             if not L: break
-            all_links.update(L); cars+=len(L); pages+=1
+            urls.update(L); cars+=len(L); pages+=1
             time.sleep(0.3)
 
-        print(f"[slice{idx}] {b} pages={pages} cars={cars}", flush=True)
+        logging.info(f"[slice{idx}] {b}  pages={pages}  cars={cars}")
 
-    print(f"[slice{idx}] done total={len(all_links)}", flush=True)
-    return all_links
+    logging.info(f"[slice{idx}] finished  total URLs={len(urls)}")
+    return urls
 
 def collect_links():
-    sess = requests.Session()
-    brands = [urljoin(BASE_URL,u) for u in
-              html.fromstring(http(urljoin(BASE_URL,"/merken"),sess).text)
-              .xpath('//main//ul/li/a/@href')]
-    print("[phase1] brands",len(brands),flush=True)
+    sess=requests.Session()
+    brand_urls=[urljoin(BASE_URL,u) for u in
+                html.fromstring(http(urljoin(BASE_URL,"/merken"),sess).text)
+                .xpath('//main//ul/li/a/@href')]
+    logging.info(f"[phase1] brand-model links = {len(brand_urls)}")
 
-    chunk  = math.ceil(len(brands)/WORKERS)
-    slices = [brands[i:i+chunk] for i in range(0,len(brands),chunk)]
+    chunk  = math.ceil(len(brand_urls)/WORKERS)
+    slices = [brand_urls[i:i+chunk] for i in range(0,len(brand_urls),chunk)]
 
     with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
         sets = pool.map(lambda t:slice_worker(*t), ((i+1,s) for i,s in enumerate(slices)))
     links = set().union(*sets)
-    print("[phase1] GRAND",len(links),flush=True)
+    logging.info(f"[phase1] GRAND TOTAL detail URLs = {len(links)}")
     return links
 
 # ───────────────────────── DETAIL scraper ─────────────────────────
 def scrape_detail(url):
-    s = requests.Session(); r = http(url,s)
+    sess = requests.Session(); r = http(url,sess)
     if not r: return None
 
-    tree = html.fromstring(r.text); t = tree.xpath
-    g = lambda lbl:(t(f'//div[normalize-space(text())="{lbl}"]/following-sibling::div/text()') or [None])[0]
-
-    imgs = [urljoin(BASE_URL,src) if src.startswith('/') else src
-            for src in t('//ul[@class="swiper-wrapper pb-10"]/li/img/@src')]
+    tree=html.fromstring(r.text); t=tree.xpath
+    val = lambda x:(t(x) or [None])[0]
+    spec= lambda lbl: val(f'//div[normalize-space(text())="{lbl}"]/following-sibling::div/text()')
 
     return dict(
         url=url,
-        title=(t('//h1/text()') or [None])[0],
-        subtitle=(t('//p[@class="type-auto-sm tablet:type-auto-m text-trustful-1"]/text()') or [None])[0],
-        financial_lease_price=(t('//div[@data-testid="price-block"]//h2/text()') or [None])[0],
-        financial_lease_term=(t('//div[@data-testid="price-block"]//p[contains(text(),"mnd")]/text()') or [None])[0],
-        advertentienummer=(t('//div[contains(text(),"Advertentienummer")]/text()') or [None])[0],
-        merk=g("Merk"), model=g("Model"), bouwjaar=g("Bouwjaar"),
-        km_stand=g("Km stand"), transmissie=g("Transmissie"), prijs=g("Prijs"),
-        brandstof=g("Brandstof"), btw_marge=g("Btw/marge"),
-        opties_accessoires=", ".join([x.strip() for x in t('//h2[contains(.,"Opties")]/following-sibling::ul/li/text()')]) or None,
-        address=(t('//div[@class="flex justify-between"]/div/p/text()') or [None])[0],
-        images=imgs
+        title=val('//h1/text()'),
+        subtitle=val('//p[@class="type-auto-sm tablet:type-auto-m text-trustful-1"]/text()'),
+        financial_lease_price=val('//div[@data-testid="price-block"]//h2/text()'),
+        financial_lease_term=val('//div[@data-testid="price-block"]//p[contains(text(),"mnd")]/text()'),
+        advertentienummer=val('//div[contains(text(),"Advertentienummer")]/text()'),
+        merk=spec("Merk"),
+        model=spec("Model"),
+        bouwjaar=spec("Bouwjaar"),
+        km_stand=spec("Km stand"),
+        transmissie=spec("Transmissie"),
+        prijs=spec("Prijs"),
+        brandstof=spec("Brandstof"),
+        btw_marge=spec("Btw/marge"),
+        opties_accessoires=", ".join(
+            x.strip() for x in t('//h2[contains(.,"Opties")]/following-sibling::ul/li/text()')
+        ) or None,
+        address=val('//div[@class="flex justify-between"]/div/p/text()'),
+        images=[urljoin(BASE_URL,src) if src.startswith('/') else src
+                for src in t('//ul[@class="swiper-wrapper pb-10"]/li/img/@src')]
     )
 
 # ───────────────────────── INSERT helpers ─────────────────────────
@@ -159,75 +156,97 @@ INSERT INTO car_listings (
 """
 INS_IMAGES = "INSERT INTO car_images (image_url,car_listing_id) VALUES %s"
 
+def safe_execute_values(cur, sql, rows, **kw):
+    """
+    Tries execute_values bulk; on DataError inserts rows one-by-one
+    and logs/skips the offenders.
+    """
+    try:
+        psycopg2.extras.execute_values(cur, sql, rows, **kw)
+        return []
+
+    except psycopg2.Error as e:
+        err_rows = []
+        # per-row salvage
+        for row in rows:
+            try:
+                psycopg2.extras.execute_values(cur, sql, [row], **kw)
+            except psycopg2.Error:
+                err_rows.append(row)
+                cur.connection.rollback()     # clear error state
+        return err_rows
+
 def bulk_insert(cur, recs):
+    skipped = []
+
     for i in range(0,len(recs),LISTING_CHUNK):
         chunk = recs[i:i+LISTING_CHUNK]
 
-        listing_rows = [(
-            clip(r["url"],     "url"),
-            clip(r["title"],   "title"),
-            clip(r["subtitle"],"subtitle"),
-            r["financial_lease_price"],
-            r["financial_lease_term"],
-            r["advertentienummer"],
-            r["merk"],
-            r["model"],
-            r["bouwjaar"],
-            r["km_stand"],
-            r["transmissie"],
-            r["prijs"],
-            r["brandstof"],
-            r["btw_marge"],
-            r["opties_accessoires"],
-            clip(r["address"], "address")
+        listing_rows=[(
+            r["url"], r["title"], r["subtitle"], r["financial_lease_price"],
+            r["financial_lease_term"], r["advertentienummer"], r["merk"],
+            r["model"], r["bouwjaar"], r["km_stand"], r["transmissie"],
+            r["prijs"], r["brandstof"], r["btw_marge"],
+            r["opties_accessoires"], r["address"]
         ) for r in chunk]
 
-        psycopg2.extras.execute_values(cur, INS_LISTINGS, listing_rows, page_size=500)
-        ids = [row[0] for row in cur.fetchall()]
+        bad = safe_execute_values(cur, INS_LISTINGS, listing_rows, page_size=500)
+        ids  = [row[0] for row in cur.fetchall()] if not bad else []
 
-        img_rows = [(img,lid) for rec,lid in zip(chunk,ids) for img in rec["images"]]
+        img_rows=[]
+        for rec,lid in zip(chunk,ids):
+            img_rows.extend((img,lid) for img in rec["images"])
+
         for j in range(0,len(img_rows),IMAGE_CHUNK):
-            psycopg2.extras.execute_values(cur, INS_IMAGES, img_rows[j:j+IMAGE_CHUNK], page_size=1000)
+            safe_execute_values(cur, INS_IMAGES, img_rows[j:j+IMAGE_CHUNK], page_size=1000)
+
+        skipped.extend(bad)
+
+    return skipped
 
 # ───────────────────────── MAIN ─────────────────────────
 def main():
-    print("[info] start",flush=True)
+    logging.info("scraper start")
     links = collect_links()
 
-    conn,cur=db(),None
+    conn, cur = psycopg2.connect(DB_DSN), None
     try:
         cur = conn.cursor()
-        cur.execute("SELECT url FROM car_listings")
+        cur.execute("SELECT url FROM car_listings;")
         existing = {u for (u,) in cur.fetchall()}
 
         new_urls = list(links-existing)
         obsolete = list(existing-links)
-        print(f"[info] new={len(new_urls)} obsolete={len(obsolete)}",flush=True)
+        logging.info(f"new={len(new_urls)}  obsolete={len(obsolete)}")
 
         if obsolete:
             cur.execute("SELECT id FROM car_listings WHERE url = ANY(%s)", (obsolete,))
-            ids = [i for (i,) in cur.fetchall()]
+            ids=[i for (i,) in cur.fetchall()]
             if ids:
                 cur.execute("DELETE FROM car_images WHERE car_listing_id = ANY(%s)", (ids,))
             cur.execute("DELETE FROM car_listings WHERE url = ANY(%s)", (obsolete,))
             conn.commit()
-            print("[info] obsolete deleted",flush=True)
+            logging.info("obsolete deleted")
 
+        # ─── parse + insert in batches ──────────────────────
         if new_urls:
-            print("[info] scraping details batch-wise …",flush=True)
+            logging.info("scraping details batch-wise …")
             for i in range(0,len(new_urls),PARSE_CHUNK):
                 batch = new_urls[i:i+PARSE_CHUNK]
-                print(f"[batch {i//PARSE_CHUNK+1}] urls={len(batch)}",flush=True)
+                logging.info(f"[batch {i//PARSE_CHUNK+1}] urls={len(batch)}")
 
                 with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
                     recs = [r for r in pool.map(scrape_detail,batch) if r]
 
-                print(f"[batch {i//PARSE_CHUNK+1}] parsed={len(recs)}  mem={mem_mb()} MB → inserting",flush=True)
-                bulk_insert(cur,recs); conn.commit()
+                logging.info(f"[batch {i//PARSE_CHUNK+1}] parsed={len(recs)}  mem={mem_mb()} MB → inserting")
+                skipped = bulk_insert(cur,recs); conn.commit()
+
+                if skipped:
+                    logging.warning(f"{len(skipped)} rows skipped due to DB errors")
 
                 del recs; gc.collect()
 
-        print("[info] scraper done",flush=True)
+        logging.info("scraper finished OK")
 
     finally:
         if cur: cur.close()
