@@ -62,7 +62,7 @@ def get_listing_links(page_url, sess):
     if not tree.xpath('//a[@data-testid="product-result-1"]'):
         return []
     links = []
-    for i in range(1, 17):
+    for i in range(16):
         links += tree.xpath(f'//a[@data-testid="product-result-{i}"]/@href')
     return [urljoin(BASE_URL, x) for x in links]
 
@@ -71,9 +71,11 @@ def scrape_slice(slice_id, brand_subset):
     sess = requests.Session()
     detail_links = set()
     for brand_url in brand_subset:
-        pages = 0
-        cars  = 0
+        
+        base_url = f"{brand_url}?lease_type=financial&entity=business"
+        pages = cars = 0
         page  = 1
+        
         while True:
             url = f"{brand_url}&page={page}" if page > 1 else brand_url
             links = get_listing_links(url, sess)
