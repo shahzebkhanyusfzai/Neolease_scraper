@@ -24,11 +24,18 @@ HEADERS = {
 WORKERS = 10        # number of concurrent threads for both phases
 
 # Hard-coded DB creds (legacy style)
-DB_NAME = "neolease_db"
-DB_USER = "neolease_db_user"
-DB_PASS = "DKuNZ0Z4OhuNKWvEFaAuWINgr7BfgyTE"
-DB_HOST = "dpg-cvslkuvdiees73fiv97g-a.oregon-postgres.render.com"
+# DB_NAME = "neolease_db"
+# DB_USER = "neolease_db_user"
+# DB_PASS = "DKuNZ0Z4OhuNKWvEFaAuWINgr7BfgyTE"
+# DB_HOST = "dpg-cvslkuvdiees73fiv97g-a.oregon-postgres.render.com"
+# DB_PORT = "5432"
+# Hard-coded DB creds (kpz9 instance)
+DB_NAME = "neolease_db_kpz9"
+DB_USER = "neolease_db_kpz9_user"
+DB_PASS = "33H6QVFnAouvau72DlSjuKAMe5GdfviD"      # or the new rotated one
+DB_HOST = "dpg-d0f0ihh5pdvs73b6h3bg-a.oregon-postgres.render.com"
 DB_PORT = "5432"
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # DB CONNECTION
