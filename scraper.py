@@ -1,213 +1,296 @@
 #!/usr/bin/env python3
 """
-DTC-Lease scraper  •  10-slice worker model  •  span-based pagination
+DTC-Lease scraper  –  10-slice workers
+* span-based pagination
+* chunked bulk inserts   (LISTING_CHUNK = 2 000, IMAGE_CHUNK = 10 000)
+* NO server-side image filtering – front-end JS will hide 404s
 """
 
-import math, re, threading, time, concurrent.futures
-import requests, psycopg2, psycopg2.extras
+import math, re, time, concurrent.futures, requests, psycopg2, psycopg2.extras
 from urllib.parse import urljoin
 from lxml import html
 
-# ─────────────────────────  CONFIG  ─────────────────────────
-BASE_URL = "https://www.dtc-lease.nl"
-HEADERS  = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
-WORKERS  = 10      # slices & detail threads
+# ───────────────────────── CONFIG ─────────────────────────
+BASE_URL     = "https://www.dtc-lease.nl"
+HEADERS      = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
+WORKERS      = 10
 
-DB_NAME  = "neolease_db_kpz9"
-DB_USER  = "neolease_db_kpz9_user"
-DB_PASS  = "33H6QVFnAouvau72DlSjuKAMe5GdfviD"
-DB_HOST  = "dpg-d0f0ihh5pdvs73b6h3bg-a.oregon-postgres.render.com"
-DB_PORT  = "5432"
+LISTING_CHUNK = 2_000          # how many listings per execute_values()
+IMAGE_CHUNK   = 10_000         # how many image rows per execute_values()
 
-# ─────────────────────────  DB  ─────────────────────────
-def connect_db():
+DB_NAME = "neolease_db_kpz9"
+DB_USER = "neolease_db_kpz9_user"
+DB_PASS = "33H6QVFnAouvau72DlSjuKAMe5GdfviD"
+DB_HOST = "dpg-d0f0ihh5pdvs73b6h3bg-a.oregon-postgres.render.com"
+DB_PORT = "5432"
+
+
+def db():
     return psycopg2.connect(
-        dbname=DB_NAME, user=DB_USER, password=DB_PASS,
-        host=DB_HOST,  port=DB_PORT, sslmode="require", connect_timeout=10
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS,
+        host=DB_HOST,
+        port=DB_PORT,
+        sslmode="require",
     )
 
-# ─────────────────────────  HTTP  ─────────────────────────
-def robust_fetch(url, sess, tries=4):
-    back = [10, 30, 60, 120]
-    for a in range(tries):
+
+# ───────────────────────── HTTP helpers ─────────────────────────
+def http(url: str, sess: requests.Session, tries: int = 3):
+    """robust GET with small exponential back-off"""
+    for i in range(tries):
         try:
-            r = sess.get(url, headers=HEADERS, timeout=15)
-            if r.status_code in (403, 429):
-                if a < tries-1: time.sleep(back[a]); continue
-                return None
+            r = sess.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
+            if r.status_code in (403, 429) and i < tries - 1:
+                time.sleep((i + 1) * 10)
+                continue
             return r
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-            if a < tries-1: time.sleep(back[a])
+        except (requests.Timeout, requests.ConnectionError):
+            if i < tries - 1:
+                time.sleep((i + 1) * 10)
     return None
 
-def get_brand_links(sess):
-    r = robust_fetch(urljoin(BASE_URL, "/merken"), sess)
-    if not r: return []
-    tree = html.fromstring(r.text)
-    rel  = tree.xpath('//main[@id="main-content"]//ul/li/a/@href')
-    return [urljoin(BASE_URL, u) for u in rel]
 
-def extract_total(tree):
-    """
-    Returns integer inside “Toon resultaten (489)”
-    or None if not found.
-    """
-    txts = tree.xpath('//span[contains(text(),"Toon resultaten")]/text()')
-    if not txts: return None
-    m = re.search(r'\((\d+)\)', txts[0])
-    return int(m.group(1)) if m else None
+def total_results(tree: html.HtmlElement):
+    """pulls integer from “Toon resultaten (489)” span, else None"""
+    t = tree.xpath('//span[contains(text(),"Toon resultaten")]/text()')
+    if t and (m := re.search(r"\((\d+)\)", t[0])):
+        return int(m.group(1))
+    return None
 
-def listing_links(tree):
-    links=[]
+
+def list_links(tree: html.HtmlElement):
+    """return up to 16 detail links on a listing page"""
+    links = []
     for i in range(16):
         links += tree.xpath(f'//a[@data-testid="product-result-{i}"]/@href')
     return [urljoin(BASE_URL, u) for u in links]
 
-def scrape_listing_page(url, sess):
-    r = robust_fetch(url, sess)
-    if not r: return [], None
-    tree = html.fromstring(r.text)
-    if not tree.xpath('//a[@data-testid="product-result-1"]'):
-        return [], None
-    return listing_links(tree), extract_total(tree)
 
-# ─────────────────────────  SLICE WORKER  ─────────────────────────
-def scrape_slice(slice_id, brand_subset):
+# ───────────────────────── slice worker ─────────────────────────
+def slice_worker(idx: int, brands: list[str]):
     sess = requests.Session()
-    detail = set()
-    for brand_url in brand_subset:
-        base = f"{brand_url}?lease_type=financial&entity=business"
-        page, cars, pages = 1, 0, 0
+    all_links = set()
 
-        # page 1
-        links, total = scrape_listing_page(base, sess)
-        if links:
-            detail.update(links)
-            cars  += len(links); pages += 1
-        total_pages = math.ceil(total/16) if total else None
+    for b in brands:
+        base = f"{b}?lease_type=financial&entity=business"
+        r = http(base, sess)
+        pages = cars = 0
+        if not r:
+            continue
 
-        # pages 2+
+        tree = html.fromstring(r.text)
+        L = list_links(tree)
+        all_links.update(L)
+        pages += 1
+        cars += len(L)
+
+        max_pages = math.ceil(total_results(tree) / 16) if total_results(tree) else None
+        p = 1
         while True:
-            page += 1
-            if total_pages and page > total_pages: break
-            url = f"{base}&page={page}"
-            links, _ = scrape_listing_page(url, sess)
-            if not links:
+            p += 1
+            if max_pages and p > max_pages:
                 break
-            detail.update(links)
-            cars  += len(links); pages += 1
-            time.sleep(0.5)
-        print(f"[slice{slice_id}] {brand_url}  pages={pages}  details={cars}", flush=True)
-    print(f"[slice{slice_id}] finished  total details={len(detail)}", flush=True)
-    return detail
+            r = http(f"{base}&page={p}", sess)
+            if not r or "product-result-1" not in r.text:
+                break
+            L = list_links(html.fromstring(r.text))
+            if not L:
+                break
+            all_links.update(L)
+            cars += len(L)
+            pages += 1
+            time.sleep(0.3)
 
-def collect_detail_urls():
-    sess   = requests.Session()
-    brands = get_brand_links(sess)
-    print(f"[phase1] brand-models = {len(brands)}", flush=True)
+        print(f"[slice{idx}] {b} pages={pages} cars={cars}", flush=True)
 
-    chunk  = math.ceil(len(brands)/WORKERS)
-    slices = [brands[i:i+chunk] for i in range(0, len(brands), chunk)]
+    print(f"[slice{idx}] done total={len(all_links)}", flush=True)
+    return all_links
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        all_sets = pool.map(lambda t: scrape_slice(*t),
-                            ((i,s) for i,s in enumerate(slices,1)))
-    all_urls = set().union(*all_sets)
-    print(f"[phase1] GRAND TOTAL detail URLs = {len(all_urls)}", flush=True)
-    return all_urls
 
-# ─────────────────────────  DETAIL SCRAPER  ─────────────────────────
-def parse_detail(url):
+def collect_links():
     sess = requests.Session()
-    r = robust_fetch(url, sess)
-    if not r: return None
-    tree = html.fromstring(r.text); t = tree.xpath
-    spec = lambda lbl:(t(f'//div[normalize-space(text())="{lbl}"]/following-sibling::div/text()') or [None])[0]
-    rec  = {
-      "url":url,
-      "title":(t('//h1/text()') or [None])[0],
-      "subtitle":(t('//p[@class="type-auto-sm tablet:type-auto-m text-trustful-1"]/text()') or [None])[0],
-      "financial_lease_price":(t('//div[@data-testid="price-block"]//h2/text()') or [None])[0],
-      "financial_lease_term":(t('//div[@data-testid="price-block"]//p[contains(text(),"mnd")]/text()') or [None])[0],
-      "advertentienummer":(t('//div[contains(text(),"Advertentienummer")]/text()') or [None])[0],
-      "merk":spec("Merk"), "model":spec("Model"), "bouwjaar":spec("Bouwjaar"),
-      "km_stand":spec("Km stand"), "transmissie":spec("Transmissie"),
-      "prijs":spec("Prijs"), "brandstof":spec("Brandstof"), "btw_marge":spec("Btw/marge"),
-      "opties_accessoires":", ".join([x.strip() for x in t('//h2[contains(.,"Opties")]/following-sibling::ul/li/text()')]) or None,
-      "address":(t('//div[@class="flex justify-between"]/div/p/text()') or [None])[0],
-      "images":[urljoin(BASE_URL,src) if src.startswith('/') else src
-               for src in t('//ul[@class="swiper-wrapper pb-10"]/li/img/@src')]
+    brands = [
+        urljoin(BASE_URL, u)
+        for u in html.fromstring(http(urljoin(BASE_URL, "/merken"), sess).text).xpath(
+            "//main//ul/li/a/@href"
+        )
+    ]
+    print("[phase1] brands", len(brands), flush=True)
+
+    chunk = math.ceil(len(brands) / WORKERS)
+    slices = [brands[i : i + chunk] for i in range(0, len(brands), chunk)]
+
+    with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
+        result_sets = pool.map(
+            lambda t: slice_worker(*t), ((i + 1, s) for i, s in enumerate(slices))
+        )
+
+    links = set().union(*result_sets)
+    print("[phase1] GRAND", len(links), flush=True)
+    return links
+
+
+# ───────────────────────── detail scrape ─────────────────────────
+def scrape_detail(url: str):
+    sess = requests.Session()
+    r = http(url, sess)
+    if not r:
+        return None
+
+    tree = html.fromstring(r.text)
+    t = tree.xpath
+    get = (
+        lambda lbl: (
+            t(
+                f'//div[normalize-space(text())="{lbl}"]/following-sibling::div/text()'
+            )
+            or [None]
+        )[0]
+    )
+
+    images = [
+        urljoin(BASE_URL, src) if src.startswith("/") else src
+        for src in t('//ul[@class="swiper-wrapper pb-10"]/li/img/@src')
+    ]
+
+    return {
+        "url": url,
+        "title": (t("//h1/text()") or [None])[0],
+        "subtitle": (
+            t('//p[@class="type-auto-sm tablet:type-auto-m text-trustful-1"]/text()')
+            or [None]
+        )[0],
+        "financial_lease_price": (
+            t('//div[@data-testid="price-block"]//h2/text()') or [None]
+        )[0],
+        "financial_lease_term": (
+            t(
+                '//div[@data-testid="price-block"]//p[contains(text(),"mnd")]/text()'
+            )
+            or [None]
+        )[0],
+        "advertentienummer": (
+            t('//div[contains(text(),"Advertentienummer")]/text()') or [None]
+        )[0],
+        "merk": get("Merk"),
+        "model": get("Model"),
+        "bouwjaar": get("Bouwjaar"),
+        "km_stand": get("Km stand"),
+        "transmissie": get("Transmissie"),
+        "prijs": get("Prijs"),
+        "brandstof": get("Brandstof"),
+        "btw_marge": get("Btw/marge"),
+        "opties_accessoires": ", ".join(
+            [x.strip() for x in t('//h2[contains(.,"Opties")]/following-sibling::ul/li/text()')]
+        )
+        or None,
+        "address": (t('//div[@class="flex justify-between"]/div/p/text()') or [None])[0],
+        "images": images,
     }
-    return rec
 
-# ─────────────────────────  MAIN  ─────────────────────────
+
+# ───────────────────────── insert helpers ─────────────────────────
+INSERT_LISTINGS = """
+    INSERT INTO car_listings (
+      url,title,subtitle,financial_lease_price,financial_lease_term,
+      advertentienummer,merk,model,bouwjaar,km_stand,
+      transmissie,prijs,brandstof,btw_marge,opties_accessoires,address
+    ) VALUES %s RETURNING id;
+"""
+INSERT_IMAGES = "INSERT INTO car_images (image_url,car_listing_id) VALUES %s"
+
+
+def bulk_insert(cur, recs):
+    for i in range(0, len(recs), LISTING_CHUNK):
+        chunk = recs[i : i + LISTING_CHUNK]
+
+        listing_rows = [
+            (
+                r["url"],
+                r["title"],
+                r["subtitle"],
+                r["financial_lease_price"],
+                r["financial_lease_term"],
+                r["advertentienummer"],
+                r["merk"],
+                r["model"],
+                r["bouwjaar"],
+                r["km_stand"],
+                r["transmissie"],
+                r["prijs"],
+                r["brandstof"],
+                r["btw_marge"],
+                r["opties_accessoires"],
+                r["address"],
+            )
+            for r in chunk
+        ]
+        psycopg2.extras.execute_values(
+            cur, INSERT_LISTINGS, listing_rows, page_size=500
+        )
+        ids = [row[0] for row in cur.fetchall()]
+
+        img_rows = [
+            (img, lid) for rec, lid in zip(chunk, ids) for img in rec["images"]
+        ]
+        # possibly many images → chunk those too
+        for j in range(0, len(img_rows), IMAGE_CHUNK):
+            psycopg2.extras.execute_values(
+                cur, INSERT_IMAGES, img_rows[j : j + IMAGE_CHUNK], page_size=1000
+            )
+
+
+# ───────────────────────── main ─────────────────────────
 def main():
-    print("[info] scraper start", flush=True)
-    all_urls = collect_detail_urls()
+    print("[info] start", flush=True)
+    links = collect_links()
 
-    conn, cur = connect_db(), None
+    conn, cur = db(), None
     try:
         cur = conn.cursor()
-        cur.execute("SELECT url FROM car_listings;")
-        existing = {r[0] for r in cur.fetchall()}
-        new_urls = list(all_urls - existing)
-        obsolete = list(existing - all_urls)
-        print(f"[info] overlap={len(all_urls & existing)}  new={len(new_urls)}  obsolete={len(obsolete)}", flush=True)
+        cur.execute("SELECT url FROM car_listings")
+        existing = {u for (u,) in cur.fetchall()}
 
-        # safe delete
-        if obsolete:
-            cur.execute("SELECT id FROM car_listings WHERE url = ANY(%s)", (obsolete,))
-            ids = [r[0] for r in cur.fetchall()]
-            if ids:
-                cur.execute("DELETE FROM car_images WHERE car_listing_id = ANY(%s)", (ids,))
-            cur.execute("DELETE FROM car_listings WHERE url = ANY(%s)", (obsolete,))
-            conn.commit()
-            print(f"[info] deleted {cur.rowcount} obsolete listings", flush=True)
+        new_urls = list(links - existing)
+        obsolete_urls = list(existing - links)
+        print(f"[info] new={len(new_urls)} obsolete={len(obsolete_urls)}", flush=True)
 
-        # scrape new
-        if new_urls:
-            print("[info] scraping new detail pages…", flush=True)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
-                records = list(filter(None, pool.map(parse_detail, new_urls)))
-            print(f"[info] parsed {len(records)} new records", flush=True)
-
-            if records:
-                listing_rows = [
-                    (r["url"], r["title"], r["subtitle"], r["financial_lease_price"],
-                     r["financial_lease_term"], r["advertentienummer"], r["merk"],
-                     r["model"], r["bouwjaar"], r["km_stand"], r["transmissie"],
-                     r["prijs"], r["brandstof"], r["btw_marge"],
-                     r["opties_accessoires"], r["address"])
-                    for r in records
-                ]
-                psycopg2.extras.execute_values(
-                    cur,
-                    """
-                    INSERT INTO car_listings (
-                      url,title,subtitle,financial_lease_price,financial_lease_term,
-                      advertentienummer,merk,model,bouwjaar,km_stand,
-                      transmissie,prijs,brandstof,btw_marge,opties_accessoires,address
-                    ) VALUES %s RETURNING id
-                    """,
-                    listing_rows, page_size=500
+        # remove obsolete listings + images
+        if obsolete_urls:
+            cur.execute(
+                "SELECT id FROM car_listings WHERE url = ANY(%s)", (obsolete_urls,)
+            )
+            obsolete_ids = [i for (i,) in cur.fetchall()]
+            if obsolete_ids:
+                cur.execute(
+                    "DELETE FROM car_images WHERE car_listing_id = ANY(%s)",
+                    (obsolete_ids,),
                 )
-                ids = [r[0] for r in cur.fetchall()]
+            cur.execute(
+                "DELETE FROM car_listings WHERE url = ANY(%s)", (obsolete_urls,)
+            )
+            conn.commit()
+            print("[info] obsolete deleted", flush=True)
 
-                img_rows = [(img, lid) for rec, lid in zip(records, ids) for img in rec["images"]]
-                if img_rows:
-                    psycopg2.extras.execute_values(
-                        cur,
-                        "INSERT INTO car_images (image_url,car_listing_id) VALUES %s",
-                        img_rows, page_size=1000
-                    )
-                conn.commit()
-                print(f"[info] inserted {len(listing_rows)} listings + {len(img_rows)} images", flush=True)
+        # scrape & insert new listings
+        if new_urls:
+            print("[info] scraping details …", flush=True)
+            with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
+                records = list(filter(None, pool.map(scrape_detail, new_urls)))
+            print(f"[info] parsed {len(records)} records — inserting", flush=True)
+            bulk_insert(cur, records)
+            conn.commit()
+            print("[info] inserted OK", flush=True)
 
         print("[info] scraper done", flush=True)
 
     finally:
-        if cur: cur.close()
+        if cur:
+            cur.close()
         conn.close()
+
 
 if __name__ == "__main__":
     main()
