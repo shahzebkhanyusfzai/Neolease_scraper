@@ -44,6 +44,40 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
+
+# ── helper (place it near the top, right after the imports) ───────────────
+from itertools import chain
+IMG_XPATHS = [
+    # any <img> in the classical gallery
+    '//ul[contains(@class,"swiper-wrapper")]//img/@src',
+    # <picture> variants
+    '//picture/source/@srcset',      # srcset contains 1–3 URLs
+    '//picture/img/@src',
+]
+def extract_images(tree):
+    """return deduped list of absolute image URLs, handles srcset"""
+    raw = list(chain.from_iterable(tree.xpath(xp) for xp in IMG_XPATHS))
+    cleaned = []
+    for r in raw:
+        # split comma-separated srcset and keep only the URL part
+        for seg in r.split(","):
+            u = seg.strip().split()[0]
+            if not u:
+                continue
+            if u.startswith("//"):
+                u = "https:" + u
+            elif u.startswith("/"):
+                u = urljoin(BASE_URL, u)
+            cleaned.append(u)
+    # de-duplicate while preserving order
+    seen, out = set(), []
+    for u in cleaned:
+        if u not in seen:
+            seen.add(u); out.append(u)
+    return out
+
+
+
 # ───────────────────────── HTTP helpers ─────────────────────────
 def http(url, sess, tries=3):
     for i in range(tries):
@@ -142,8 +176,12 @@ def scrape_detail(url):
             x.strip() for x in t('//h2[contains(.,"Opties")]/following-sibling::ul/li/text()')
         ) or None,
         address=val('//div[@class="flex justify-between"]/div/p/text()'),
-        images=[urljoin(BASE_URL,src) if src.startswith('/') else src
-                for src in t('//ul[@class="swiper-wrapper pb-10"]/li/img/@src')]
+        images = extract_images(tree)
+        if not images:
+            logging.warning(f"[no-images] {url}")
+            return None            # skip cars that genuinely have zero photos
+
+
     )
 
 # ───────────────────────── INSERT helpers ─────────────────────────
