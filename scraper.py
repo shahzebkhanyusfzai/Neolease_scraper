@@ -203,43 +203,72 @@ def bulk_insert(cur,recs):
 # ───────────────────────── MAIN ─────────────────────────
 def main():
     logging.info("scraper start")
-    build_id=get_build_id(requests.Session())
+    build_id = get_build_id(requests.Session())
     logging.info(f"buildId={build_id}")
 
-    links=collect_links()
+    links = collect_links()
     logging.info(f"detail URLs = {len(links)}")
 
-    conn=psycopg2.connect(DB_DSN); cur=None
+    conn = psycopg2.connect(DB_DSN)
+    cur  = None
     try:
-        cur=conn.cursor()
+        cur = conn.cursor()
+
+        # Fetch existing URLs so we can diff
         cur.execute("SELECT url FROM car_listings;")
-        existing={u for (u,) in cur.fetchall()}
-        new_urls=list(links-existing)
-        obsolete=list(existing-links)
+        existing = {u for (u,) in cur.fetchall()}
+
+        new_urls   = [u for u in links if u not in existing]
+        obsolete   = [u for u in existing if u not in links]
         logging.info(f"new={len(new_urls)} obsolete={len(obsolete)}")
 
+        # Delete any listings (and images) that are no longer on the site
         if obsolete:
-            cur.execute("SELECT id FROM car_listings WHERE url = ANY(%s)",(obsolete,))
-            ids=[i for (i,) in cur.fetchall()]
-            if ids: cur.execute("DELETE FROM car_images WHERE car_listing_id = ANY(%s)",(ids,))
-            cur.execute("DELETE FROM car_listings WHERE url = ANY(%s)",(obsolete,))
-            conn.commit(); logging.info("obsolete deleted")
+            cur.execute("SELECT id FROM car_listings WHERE url = ANY(%s)", (obsolete,))
+            ids = [i for (i,) in cur.fetchall()]
+            if ids:
+                cur.execute("DELETE FROM car_images WHERE car_listing_id = ANY(%s)", (ids,))
+                cur.execute("DELETE FROM car_listings WHERE id = ANY(%s)", (ids,))
+                conn.commit()
+                logging.info("obsolete deleted")
 
+        # Process newly found URLs in batches
         if new_urls:
             logging.info("scraping details…")
-            for i in range(0,len(new_urls),PARSE_CHUNK):
-                batch=new_urls[i:i+PARSE_CHUNK]
-                logging.info(f"[batch {i//PARSE_CHUNK+1}] urls={len(batch)}")
+            for batch_start in range(0, len(new_urls), PARSE_CHUNK):
+                batch = new_urls[batch_start : batch_start + PARSE_CHUNK]
+                logging.info(f"[batch {batch_start//PARSE_CHUNK + 1}] urls={len(batch)}")
+
+                # Scrape each detail page in parallel
                 with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
-                    recs=[r for r in pool.map(lambda u:scrape_detail_api(u,build_id),batch) if r]
-                logging.info(f"[batch {i//PARSE_CHUNK+1}] parsed={len(recs)} mem={mem_mb()} MB → insert")
-                skipped=bulk_insert(cur,recs); conn.commit()
-                if skipped: logging.warning(f"{len(skipped)} rows skipped")
-                del recs; gc.collect()
+                    recs = [
+                        r for r in pool.map(lambda u: scrape_detail_api(u, build_id), batch)
+                        if r
+                    ]
+
+                # ── Shuffle this batch before inserting ──
+                import random
+                random.shuffle(recs)
+                logging.info(f"[batch {batch_start//PARSE_CHUNK + 1}] shuffled={len(recs)} records")
+
+                # Insert listings + images
+                logging.info(f"[batch {batch_start//PARSE_CHUNK + 1}] inserting… mem={mem_mb()} MB")
+                skipped = bulk_insert(cur, recs)
+                conn.commit()
+                if skipped:
+                    logging.warning(f"{len(skipped)} rows skipped")
+
+                # Clean up for the next batch
+                del recs
+                gc.collect()
 
         logging.info("scraper finished OK")
-    finally:
-        if cur: cur.close(); conn.close()
 
-if __name__=="__main__":
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
+
+
+if __name__ == "__main__":
     main()
