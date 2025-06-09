@@ -10,6 +10,7 @@ DTC-Lease scraper – Render version – JSON / _next/data endpoint
 import os, re, time, gc, math, logging, concurrent.futures, requests
 from itertools import chain
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
+from concurrent.futures import ThreadPoolExecutor
 
 import psycopg2, psycopg2.extras
 from lxml import html
@@ -123,7 +124,7 @@ def collect_links():
     brands=brand_links(sess)
     chunk=math.ceil(len(brands)/WORKERS)
     slices=[brands[i:i+chunk] for i in range(0,len(brands),chunk)]
-    with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
+    with ThreadPoolExecutor(WORKERS) as pool:
         sets=pool.map(lambda t:slice_worker(*t),((i+1,s) for i,s in enumerate(slices)))
     return set().union(*sets)
 
@@ -157,8 +158,9 @@ def json_to_record(detail_url,data):
         rec[k]=pval(pd,k)
     return rec if rec["images"] else None          # keep same “skip imageless” rule
 
-def scrape_detail_api(url,build_id):
-    sess=requests.Session(); car_id=url.rstrip("/").split("/")[-1]
+def scrape_detail_api(sess,url,build_id):
+    # sess=requests.Session(); car_id=url.rstrip("/").split("/")[-1]
+    car_id = url.rstrip("/").split("/")[-1]   # ← put this back
     r=http(api_endpoint(build_id,car_id),sess)
     if not r: return None
     try:
@@ -239,12 +241,13 @@ def main():
                 batch = new_urls[batch_start : batch_start + PARSE_CHUNK]
                 logging.info(f"[batch {batch_start//PARSE_CHUNK + 1}] urls={len(batch)}")
 
-                # Scrape each detail page in parallel
-                with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
-                    recs = [
-                        r for r in pool.map(lambda u: scrape_detail_api(u, build_id), batch)
-                        if r
-                    ]
+                # Scrape each detail page in parallelwith ThreadPoolExecutor(WORKERS) as pool:
+                recs = [
+                    r for r in pool.map(
+                        lambda u: scrape_detail_api(requests.Session(), u, build_id),
+                        batch
+                    ) if r
+                ]
 
                 # ── Shuffle this batch before inserting ──
                 import random
