@@ -6,7 +6,7 @@ DTC-Lease scraper – Render version – JSON / _next/data endpoint
 * Replaces the old HTML parser with a pure-API parser
 * Adds all new spec columns that live in product_data
 """
-
+import threading
 import os, re, time, gc, math, logging, concurrent.futures, requests
 from itertools import chain
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
@@ -241,13 +241,17 @@ def main():
                 batch = new_urls[batch_start : batch_start + PARSE_CHUNK]
                 logging.info(f"[batch {batch_start//PARSE_CHUNK + 1}] urls={len(batch)}")
 
-                # Scrape each detail page in parallelwith ThreadPoolExecutor(WORKERS) as pool:
-                recs = [
-                    r for r in pool.map(
-                        lambda u: scrape_detail_api(requests.Session(), u, build_id),
-                        batch
-                    ) if r
-                ]
+                thread_local = threading.local()
+                def scrape_threadsafe(url):
+                    """One requests.Session per thread (keep-alive reuse)."""
+                    if not hasattr(thread_local, "sess"):
+                        thread_local.sess = requests.Session()
+                    return scrape_detail_api(thread_local.sess, url, build_id)
+                
+                # Scrape each detail page in parallel
+                with ThreadPoolExecutor(WORKERS) as pool:
+                    recs = [r for r in pool.map(scrape_threadsafe, batch) if r]
+
 
                 # ── Shuffle this batch before inserting ──
                 import random
