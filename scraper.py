@@ -54,8 +54,16 @@ logging.basicConfig(level=logging.INFO,
 # per-column limits (fallback = 120)
 LIMIT = dict(title=120, subtitle=120, address=240, url=200)
 def clip(v, f):
-    lim = LIMIT.get(f, 120)          # default 120
-    return v[:lim] if v and len(v) > lim else v
+    """
+    • Strings  → truncate to LIMIT[f] (default 120)
+    • Other types (int, float, Decimal, None) → pass through unchanged
+    """
+    if v is None:
+        return None
+    if isinstance(v, (str, bytes)):
+        lim = LIMIT.get(f, 120)
+        return v[:lim] if len(v) > lim else v
+    return v
 
 def http(url, sess, tries=4, backoff=8):
     for i in range(tries):
