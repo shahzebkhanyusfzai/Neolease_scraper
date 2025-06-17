@@ -249,6 +249,9 @@ def bulk_insert(cur, recs):
     for start in range(0, len(img_rows), IMAGE_CHUNK):
         copy_images(cur, img_rows[start:start + IMAGE_CHUNK])
 
+    return sum(1 for lid in ids if lid is not None)   # ← add this line
+
+
 
 # ───────── MAIN ─────────
 def main():
