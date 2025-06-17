@@ -207,20 +207,48 @@ def safe_execute_values(cur, sql, rows, page_size=1000):
         logging.warning(f"execute_values fallback: {bad} rows skipped ({e.pgerror.strip()})")
         return good, bad
 
+# -- helper that ALWAYS returns a full, aligned id list -------------
+def insert_listing_rows(cur, rows, page_size=1000):
+    """
+    Insert *rows* into car_listings and return a list of ids
+    aligned 1-for-1 with the original order.
+    If a row still fails, its slot gets None so alignment is preserved.
+    """
+    try:
+        psycopg2.extras.execute_values(cur, INS_LISTINGS, rows, page_size=page_size)
+        return [r[0] for r in cur.fetchall()]          # happy path
+    except psycopg2.Error:
+        cur.connection.rollback()
+        ids = []
+        for r in rows:
+            try:
+                cur.execute(INS_LISTINGS, (r,))
+                ids.append(cur.fetchone()[0])         # good row
+            except psycopg2.Error:
+                cur.connection.rollback()
+                ids.append(None)                      # bad row -> keep placeholder
+        return ids
+
+
+# -- bulk_insert that uses the aligned ids --------------------------
 def bulk_insert(cur, recs):
-    listing_rows, img_rows = [], []
-    for r in recs:
-        listing_rows.append(tuple(
-            clip_val(r[f], f) if f != "images" else None
-            for f in ALL_FIELDS if f != "images"
-        ))
-    good, _ = safe_execute_values(cur, INS_LISTINGS, listing_rows, page_size=1000)
-    ids = [row[0] for row in cur.fetchall()]
-    for imgs, lid in zip((r["images"] for r in recs), ids):
-        img_rows.extend((u, lid) for u in imgs)
+    listing_rows = [
+        tuple(clip_val(r[f], f) if f != "images" else None
+              for f in ALL_FIELDS if f != "images")
+        for r in recs
+    ]
+
+    ids = insert_listing_rows(cur, listing_rows)       # <- new helper
+
+    img_rows = []
+    for rec, lid in zip(recs, ids):
+        if lid is None:                                # listing skipped
+            continue
+        img_rows.extend((u, lid) for u in rec["images"])
+
     for start in range(0, len(img_rows), IMAGE_CHUNK):
         copy_images(cur, img_rows[start:start + IMAGE_CHUNK])
-    return good
+
 
 # ───────── MAIN ─────────
 def main():
